@@ -1,58 +1,70 @@
-import { useState, useEffect } from 'react';
-import type { MapData } from './types';
-import './index.css';
+import { useState } from 'react';
+import { MapOverlay } from './components/Map/MapOverlay';
+import { MapControls } from './components/Map/MapControls';
+import PlayerStatsTable from './components/Analysis/PlayerStatsTable';
+import type { EngagementData } from './types/analysis';
+
+// Define the analysis data type
+interface AnalysisData {
+  players: Record<string, PlayerStats>;
+  positions: EngagementData[];
+  kills: any[];
+  rounds: any[];
+}
+
+interface PlayerStats {
+  name: string;
+  team: string;
+  kills: number;
+  deaths: number;
+  assists: number;
+  headshots: number;
+  damage: number;
+  kd_ratio: number;
+  hs_percentage: number;
+}
 
 function App() {
-  const [analysisData, setAnalysisData] = useState<MapData[]>([]);
-
-  useEffect(() => {
-    // Fetch or generate sample MapData and set it in the state
-    const sampleData: MapData[] = [
-      {
-        id: '1',
-        name: 'Location A',
-        value: 75,
-        position: {
-          x: 10,
-          y: 20,
-          z: 5,
-        },
-        success_rate: 0.8,
-        sample_size: 100,
-      },
-      {
-        id: '2',
-        name: 'Location B',
-        value: 50,
-        position: {
-          x: 15,
-          y: 30,
-          z: 8,
-        },
-        success_rate: 0.65,
-        sample_size: 80,
-      },
-    ];
-    setAnalysisData(sampleData);
-  }, []);
+  const [analysis, setAnalysis] = useState<AnalysisData | null>(null);
+  const [selectedMap, setSelectedMap] = useState('de_mirage');
+  const [analysisType, setAnalysisType] = useState<'engagements' | 'retakes' | 'executes'>('engagements');
 
   return (
-    <div className="min-h-screen bg-cs2-secondary">
-      <div className="max-w-7xl mx-auto px-4 py-8">
-        <h1 className="text-4xl font-bold text-white mb-8">CS2 Stats</h1>
-        <div className="bg-white/10 p-4 rounded-lg">
-          {analysisData.map((data) => (
-            <div key={data.id} className="mb-4">
-              <h2 className="text-lg font-medium text-white">{data.name}</h2>
-              <p className="text-white">
-                Value: {data.value}, Success Rate: {(data.success_rate * 100).toFixed(2)}%, Sample Size: {data.sample_size}
-              </p>
-              <p className="text-white">
-                Position: ({data.position.x}, {data.position.y}, {data.position.z})
-              </p>
+    <div className="min-h-screen bg-gray-100 dark:bg-gray-900 p-8">
+      <div className="max-w-7xl mx-auto">
+        <h1 className="text-4xl font-bold mb-8 text-gray-900 dark:text-white">
+          CS2 Analytics
+        </h1>
+        
+        {/* Map Controls */}
+        <MapControls
+          mapName={selectedMap}
+          onMapChange={setSelectedMap}
+          analysisType={analysisType}
+          onAnalysisTypeChange={(type) => setAnalysisType(type as 'engagements' | 'retakes' | 'executes')}
+        />
+        
+        {analysis && (
+          <div className="mt-8 space-y-8">
+            <div>
+              <h2 className="text-2xl font-semibold mb-4 text-gray-900 dark:text-white">
+                Player Statistics
+              </h2>
+              <PlayerStatsTable players={analysis.players} />
             </div>
-          ))}
-        </div>
+            
+            <div>
+              <h2 className="text-2xl font-semibold mb-4 text-gray-900 dark:text-white">
+                Match Analysis
+              </h2>
+              <MapOverlay 
+                mapName={selectedMap}
+                analysisType={analysisType}
+                data={analysis.positions}
+              />
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
