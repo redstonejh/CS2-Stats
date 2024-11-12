@@ -1659,10 +1659,10 @@ class DemoParser:
         with open(self.demo_path, 'rb') as demo_file:
             self._read_header(demo_file)
             while True:
-                packet = self._read_next_packet(demo_file)
+                packet = self._read_pbdems2_packet(demo_file)
                 if not packet:
                     break
-                self._process_packet(packet)
+                self._process_packet(demo_file, packet)
 
 
     def _parse_demo_header(self, demo_file: BinaryIO) -> Optional[DemoHeader]:
@@ -2133,27 +2133,36 @@ class DemoParser:
             10,  # DEM_USERCMD
             11,  # DEM_DATATABLES
             12,  # DEM_STRINGTABLES
-            32   # PBDEMS_CUSTOMDATA
+            13,  # DEM_USERDATA
+            14,  # DEM_CUSTOMDATA
+            15,  # DEM_STRINGCMD
+            16,  # DEM_SVCMD
+            32,  # PBDEMS_CUSTOMDATA
+            60,  # Additional valid command type
         }
-        
+
         if cmd_type not in VALID_CMD_TYPES:
-            logger.warning(f"Invalid command type: {cmd_type}")
+            self._log_packet_header_issue("Invalid command type", cmd_type, tick, size)
             return False
-            
+
         # Tick validation - CS2 uses reasonable tick values
         MAX_REASONABLE_TICK = 1_000_000  # ~4.3 hours at 64 tick
         if tick < 0 or tick > MAX_REASONABLE_TICK:
-            logger.warning(f"Unreasonable tick value: {tick}")
+            self._log_packet_header_issue("Unreasonable tick value", cmd_type, tick, size)
             return False
-            
+
         # Size validation - CS2 packets are reasonably sized
         MIN_PACKET_SIZE = 0
         MAX_PACKET_SIZE = 1024 * 1024 * 2  # 2MB max packet size
         if size < MIN_PACKET_SIZE or size > MAX_PACKET_SIZE:
-            logger.warning(f"Invalid packet size: {size}")
+            self._log_packet_header_issue("Invalid packet size", cmd_type, tick, size)
             return False
-            
+
         return True
+
+    def _log_packet_header_issue(self, message: str, cmd_type: int, tick: int, size: int) -> None:
+        logger.warning(f"{message}: type={cmd_type}, tick={tick}, size={size}")
+    
     def _read_next_packet(self, demo_file: BinaryIO) -> Optional[DemoPacket]:
         """Read next packet with enhanced debugging"""
         # Initialize position
@@ -2360,39 +2369,38 @@ class DemoParser:
             logger.error(f"Error reading packet data: {e}", exc_info=True)
             return b''  # Return an empty bytes object instead of None
     
-    def _attempt_packet_recovery(self, parser: 'DemoParser', demo_path: str) -> Optional[DemoPacket]:
+    def _attempt_packet_recovery(self, demo_file: BinaryIO) -> Optional[DemoPacket]:
         """Attempt to recover from corrupt packet by finding next valid packet"""
         MAX_RECOVERY_BYTES = 1024 * 1024  # 1MB max recovery scan
         bytes_scanned = 0
         buffer = bytearray()
 
-        with open(demo_path, 'rb') as demo_file:
-            while bytes_scanned < MAX_RECOVERY_BYTES:
-                # Read one byte at a time looking for valid packet header
-                byte = demo_file.read(1)
-                if not byte:
-                    return None  # EOF
-                bytes_scanned += 1
-                buffer.extend(byte)
+        while bytes_scanned < MAX_RECOVERY_BYTES:
+            # Read one byte at a time looking for valid packet header
+            byte = demo_file.read(1)
+            if not byte:
+                return None  # EOF
+            bytes_scanned += 1
+            buffer.extend(byte)
 
-                if len(buffer) >= 9:  # Minimum packet header size
-                    # Try to parse as packet header
-                    header = parser._read_packet_header(demo_file)
-                    if header:
-                        cmd_type, tick, size = header
-                        if parser._is_valid_packet_header(cmd_type, tick, size):
-                            # Found potential valid packet header
-                            logger.info(f"Recovered packet header at offset {bytes_scanned}")
-                            # Reset file position to start of packet
-                            demo_file.seek(-9, 1)
-                            return DemoPacket(cmd_type=cmd_type, tick=tick, data=parser._read_packet_data(demo_file, size))
+            if len(buffer) >= 9:  # Minimum packet header size
+                # Try to parse as packet header
+                header = self._read_packet_header(demo_file)
+                if header:
+                    cmd_type, tick, size = header
+                    if self._is_valid_packet_header(cmd_type, tick, size):
+                        # Found potential valid packet header
+                        logger.info(f"Recovered packet header at offset {bytes_scanned}")
+                        # Reset file position to start of packet
+                        demo_file.seek(-9, 1)
+                        return DemoPacket(cmd_type=cmd_type, tick=tick, data=self._read_packet_data(demo_file, size))
 
-                # Remove oldest byte if buffer is full
-                buffer = buffer[1:]
+            # Remove oldest byte if buffer is full
+            buffer = buffer[1:]
 
-        logger.error("Failed to recover valid packet")
+        logger.error("Failed to recover valid packet after scanning 1MB of data")
         return None
-            
+                
     def _parse_packet_header(self, header_data: bytes) -> Optional[Tuple[int, int, int]]:
         """Parse packet header with validation"""
         try:
@@ -2447,7 +2455,7 @@ class DemoParser:
             return None
 
 
-    def _process_packet(self, packet: DemoPacket) -> None:
+    def _process_packet(self, demo_file: BinaryIO, packet: DemoPacket) -> None:
         try:
             if packet.cmd_type == 7:  # Command packet
                 self._handle_command_packet(packet.data)
@@ -2456,7 +2464,7 @@ class DemoParser:
         except Exception as e:
             logger.error(f"Error processing packet: {e}")
             self._translate_packet_data(packet)
-            self._attempt_packet_recovery(self, self.demo_path)
+            self._attempt_packet_recovery(demo_file)
 
     def _translate_packet_data(self, packet: DemoPacket) -> None:
         """Translate the raw packet data into human-readable format"""
@@ -3302,11 +3310,11 @@ class DemoParser:
         return packets
 
     def _read_pbdems2_packet(self, demo_file: BinaryIO) -> Optional[DemoPacket]:
-        """Read a single packet from a PBDEMS2 demo file with better marker detection"""
+        """Read a single packet from a PBDEMS2 demo file with better marker detection and error handling"""
         try:
             # Read initial chunk for analysis
-            initial_bytes = demo_file.read(16)
-            if not initial_bytes:
+            initial_bytes = self._peek_bytes(demo_file, 16)
+            if len(initial_bytes) < 16:
                 return None
 
             # Known packet markers and their corresponding offsets to the packet data
@@ -3339,34 +3347,31 @@ class DemoParser:
                     pattern_offset = 0
                     found_pattern = initial_bytes[:1]
                 else:
-                    raise PacketReadError(f"Invalid packet marker: {initial_bytes[:4].hex()}")
+                    # No valid marker found, try to resynchronize
+                    return self._attempt_packet_recovery(demo_file)
 
             # Parse packet header after marker
             pos = pattern_offset
             cmd_type = initial_bytes[pos]
-            
-            # For PBDEMS2, tick and size are uint16 (2 bytes each)
             tick = int.from_bytes(initial_bytes[pos+1:pos+3], byteorder='little')
             size = int.from_bytes(initial_bytes[pos+3:pos+5], byteorder='little')
 
             logger.debug(f"Packet header: type={cmd_type}, tick={tick}, size={size}")
 
-            # Validate packet
-            if not self._is_valid_packet_size(size):
-                raise PacketReadError(f"Invalid packet size: {size}")
+            # Validate packet header
+            if not self._is_valid_packet_header(cmd_type, tick, size):
+                return self._attempt_packet_recovery(demo_file)
 
             # Read packet data
             remaining_data = demo_file.read(size)
             if len(remaining_data) < size:
                 raise PacketReadError(f"Incomplete packet: expected {size}, got {len(remaining_data)}")
 
-            packet = DemoPacket(cmd_type=cmd_type, tick=tick, data=remaining_data)
-            logger.debug(f"Successfully read packet: type={cmd_type}, tick={tick}, size={size}")
-            return packet
+            return DemoPacket(cmd_type=cmd_type, tick=tick, data=remaining_data)
 
         except Exception as e:
-            logger.error(f"Error reading PBDEMS2 packet: {e}")
-            raise PacketReadError(str(e))
+            logger.error(f"Error reading PBDEMS2 packet: {e}", exc_info=True)
+            return self._attempt_packet_recovery(demo_file)
         
     def _read_line(self, demo_file: BinaryIO) -> Optional[bytes]:
         """Read a line of text from the demo file"""
