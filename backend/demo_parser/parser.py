@@ -11,6 +11,7 @@ import json
 import io
 import sys
 import os
+import re
 
 
 logging.basicConfig(
@@ -45,6 +46,60 @@ class StringTableHandler(DemoMessageTypeHandler):
 class DataTableHandler(DemoMessageTypeHandler):
     def handle_packet(self, packet: DemoPacket) -> None:
         self.parser._update_data_tables(packet.data)
+
+class PacketReadError(Exception):
+    pass
+
+class DemoPacketType:
+    """CS2 Demo packet types including PBDEMS2 extensions"""
+    DEM_STOP = 2
+    DEM_FILEHEADER = 3
+    DEM_FILEINFO = 4
+    DEM_SYNCTICK = 5
+    DEM_MESSAGE = 6
+    DEM_PACKET = 7
+    DEM_SIGNONPACKET = 8
+    DEM_CONSOLECMD = 9
+    DEM_USERCMD = 10
+    DEM_DATATABLES = 11
+    DEM_STRINGTABLES = 12
+    DEM_USERDATA = 13
+    DEM_CUSTOMDATA = 14
+    DEM_STRINGCMD = 15
+    DEM_SVCMD = 16
+    DEM_VOICEDATA = 17
+    PBDEMS_CUSTOMDATA = 32
+
+    @classmethod
+    def is_valid(cls, cmd_type: int) -> bool:
+        """Check if a command type is valid"""
+        return cmd_type in {
+            cls.DEM_STOP,
+            cls.DEM_FILEHEADER,
+            cls.DEM_FILEINFO,
+            cls.DEM_SYNCTICK,
+            cls.DEM_MESSAGE,
+            cls.DEM_PACKET,
+            cls.DEM_SIGNONPACKET,
+            cls.DEM_CONSOLECMD,
+            cls.DEM_USERCMD,
+            cls.DEM_DATATABLES,
+            cls.DEM_STRINGTABLES,
+            cls.DEM_USERDATA,
+            cls.DEM_CUSTOMDATA,
+            cls.DEM_STRINGCMD,
+            cls.DEM_SVCMD,
+            cls.DEM_VOICEDATA,
+            cls.PBDEMS_CUSTOMDATA,
+        }
+
+    @classmethod
+    def get_name(cls, cmd_type: int) -> str:
+        """Get the name of a command type"""
+        for name, value in vars(cls).items():
+            if not name.startswith('_') and value == cmd_type:
+                return name
+        return f"UNKNOWN_{cmd_type}"
 
 @dataclass
 class DemoPacket:
@@ -584,34 +639,13 @@ class Round:
 
 @dataclass
 class DemoHeader:
-    """
-    CS2 Demo file header parser and container.
-    
-    Handles parsing and storing metadata from CS2 demo file headers.
-    Header format follows the HL2DEMO specification with a fixed size of 1072 bytes.
-    
-    Attributes:
-        HEADER_SIZE: Required size of header in bytes
-        MAGIC: Expected magic string for valid CS2 demos
-        raw_data: Original binary header data
-        magic: Demo file magic string ("HL2DEMO")
-        demo_protocol: Demo format protocol version
-        network_protocol: Network protocol version
-        server_name: Name of server that recorded the demo
-        client_name: Name of client that recorded the demo
-        map_name: Name of the map being played
-        game_directory: Game directory path
-        playback_time: Demo duration in seconds
-        ticks: Total number of game ticks
-        frames: Total number of frames
-        signon_length: Length of signon data
-    """
+    """CS2 Demo file header"""
     
     # Class constants
     HEADER_SIZE: ClassVar[int] = 1072
-    MAGIC: ClassVar[bytes] = b"HL2DEMO\0"
+    SUPPORTED_FORMATS = ["HL2DEMO", "PBDEMS2"]
     
-    # Fields with default values to allow both direct instantiation and from_bytes
+    # Fields with default values
     raw_data: bytes = field(repr=False)  # Exclude from repr to avoid clutter
     magic: str = field(default="")
     demo_protocol: int = field(default=0)
@@ -633,8 +667,21 @@ class DemoHeader:
                 f"expected {self.HEADER_SIZE} bytes"
             )
         
-        if self.magic and self.magic != "HL2DEMO":
-            raise ValueError(f"Invalid demo file magic: {self.magic}")
+        # Check for supported magic strings
+        magic_upper = self.magic.upper().strip('\0')
+        if not any(magic_upper.startswith(fmt) for fmt in self.SUPPORTED_FORMATS):
+            raise ValueError(
+                f"Invalid demo file magic: {self.magic}. "
+                f"Expected one of: {', '.join(self.SUPPORTED_FORMATS)}"
+            )
+            
+        # Validate numeric fields
+        if self.ticks < 0:
+            raise ValueError(f"Invalid tick count: {self.ticks}")
+        if self.frames < 0:
+            raise ValueError(f"Invalid frame count: {self.frames}")
+        if self.playback_time < 0:
+            raise ValueError(f"Invalid playback time: {self.playback_time}")
 
     @classmethod
     def from_bytes(cls, raw_data: bytes) -> 'DemoHeader':
@@ -657,26 +704,59 @@ class DemoHeader:
             )
 
         try:
-            magic = raw_data[:8].decode('ascii').strip('\0')
-            if magic != "HL2DEMO":
-                raise ValueError(f"Invalid demo file magic: {magic}")
-                
-            return cls(
+            # Try to detect format first
+            magic = raw_data[:8].decode('ascii', errors='replace').strip('\0')
+            magic_upper = magic.upper()
+            
+            # Log the magic string for debugging
+            logger.debug(f"Detected magic string: {magic}")
+            
+            header = cls(
                 raw_data=raw_data,
                 magic=magic,
                 demo_protocol=struct.unpack('i', raw_data[8:12])[0],
                 network_protocol=struct.unpack('i', raw_data[12:16])[0],
-                server_name=raw_data[16:272].decode('ascii').strip('\0'),
-                client_name=raw_data[272:528].decode('ascii').strip('\0'),
-                map_name=raw_data[528:784].decode('ascii').strip('\0'),
-                game_directory=raw_data[784:1040].decode('ascii').strip('\0'),
+                server_name=raw_data[16:272].decode('ascii', errors='replace').strip('\0'),
+                client_name=raw_data[272:528].decode('ascii', errors='replace').strip('\0'),
+                map_name=raw_data[528:784].decode('ascii', errors='replace').strip('\0'),
+                game_directory=raw_data[784:1040].decode('ascii', errors='replace').strip('\0'),
                 playback_time=struct.unpack('f', raw_data[1040:1044])[0],
                 ticks=struct.unpack('i', raw_data[1044:1048])[0],
                 frames=struct.unpack('i', raw_data[1048:1052])[0],
                 signon_length=struct.unpack('i', raw_data[1052:1056])[0]
             )
+            
+            logger.debug(f"Successfully created header: {header}")
+            return header
+            
         except (struct.error, UnicodeDecodeError) as e:
             raise ValueError(f"Failed to parse demo header: {str(e)}") from e
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert header to a dictionary format for serialization."""
+        return {
+            'magic': self.magic,
+            'demo_protocol': self.demo_protocol,
+            'network_protocol': self.network_protocol,
+            'server_name': self.server_name,
+            'client_name': self.client_name,
+            'map_name': self.map_name,
+            'game_directory': self.game_directory,
+            'playback_time': self.playback_time,
+            'ticks': self.ticks,
+            'frames': self.frames,
+            'signon_length': self.signon_length
+        }
+
+    def __str__(self) -> str:
+        """Human-readable string representation."""
+        return (
+            f"CS2 Demo: {self.map_name}\n"
+            f"Format: {self.magic}\n"
+            f"Recorded by: {self.client_name}\n"
+            f"Server: {self.server_name}\n"
+            f"Duration: {self.playback_time:.2f}s\n"
+            f"Ticks: {self.ticks}"
+        )
 
     @classmethod
     def from_file(cls, file_path: str | Path) -> 'DemoHeader':
@@ -703,32 +783,6 @@ class DemoHeader:
                 return cls.from_bytes(header_data)
         except Exception as e:
             raise ValueError(f"Failed to read demo file: {str(e)}") from e
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert header to a dictionary format for serialization."""
-        return {
-            'magic': self.magic,
-            'demo_protocol': self.demo_protocol,
-            'network_protocol': self.network_protocol,
-            'server_name': self.server_name,
-            'client_name': self.client_name,
-            'map_name': self.map_name,
-            'game_directory': self.game_directory,
-            'playback_time': self.playback_time,
-            'ticks': self.ticks,
-            'frames': self.frames,
-            'signon_length': self.signon_length
-        }
-
-    def __str__(self) -> str:
-        """Human-readable string representation."""
-        return (
-            f"CS2 Demo: {self.map_name}\n"
-            f"Recorded by: {self.client_name}\n"
-            f"Server: {self.server_name}\n"
-            f"Duration: {self.playback_time:.2f}s\n"
-            f"Ticks: {self.ticks}"
-        )
 class DemoParser:
     """CS2 Demo Parser with comprehensive analysis capabilities"""
 
@@ -789,6 +843,32 @@ class DemoParser:
         except Exception as e:
             logger.error(f"Error reading data table entry at offset {offset}: {e}", exc_info=True)
             return None
+        
+    def _handle_command_packet(self, data: bytes) -> None:
+        """Handle PBDEMS command packet"""
+        if len(data) < 4:
+            return
+            
+        try:
+            cmd_type = data[0]
+            logger.debug(f"Processing command packet type {cmd_type}")
+            # Add command packet handling here
+            pass
+        except Exception as e:
+            logger.error(f"Error handling command packet: {e}")
+
+        def _handle_data_packet(self, data: bytes) -> None:
+            """Handle PBDEMS data packet"""
+            if len(data) < 4:
+                return
+                
+            try:
+                packet_type = data[0]
+                logger.debug(f"Processing data packet type {packet_type}")
+                # Add data packet handling here
+                pass
+            except Exception as e:
+                logger.error(f"Error handling data packet: {e}")
 
     def _handle_data_tables(self, data: bytes) -> None:
         """Process data tables from the demo file"""
@@ -921,21 +1001,32 @@ class DemoParser:
             raise ValueError(f"Invalid demo file: {e}")
     
     def _read_header(self, demo_file: BinaryIO) -> None:
-        header_data = demo_file.read(DemoHeader.HEADER_SIZE)
+        """Read and parse demo header with improved format detection"""
         try:
-            self.header = DemoHeader.from_bytes(header_data)
+            header_data = demo_file.read(DemoHeader.HEADER_SIZE)
+            if len(header_data) < DemoHeader.HEADER_SIZE:
+                raise ValueError(f"Incomplete header: got {len(header_data)} bytes")
 
-            if self.header.magic == "HL2DEMO":
+            # Try to detect format
+            magic_bytes = header_data[:8]
+            if magic_bytes.startswith(b"HL2DEMO\0"):
                 logger.info("Detected HL2DEMO format")
-            elif header_data.startswith(b"PBDEMS2"):
-                logger.info("Detected PBDEMS2 format")
+                self.header = DemoHeader.from_bytes(header_data)
+            elif magic_bytes.startswith(b"PBDEMS"):
+                logger.info("Detected PBDEMS format")
                 self._parse_pbdems2_header(header_data)
             else:
-                logger.warning(f"Unknown demo file magic: {self.header.magic}")
-                self._handle_unknown_format(header_data)
+                # Try to decode magic for logging
+                magic = magic_bytes.decode('ascii', errors='replace').strip('\0')
+                logger.warning(f"Unknown demo format: {magic}")
+                # Try parsing as HL2DEMO as fallback
+                self.header = DemoHeader.from_bytes(header_data)
+
         except ValueError as e:
-            logger.error(f"Error parsing demo header: {e}")
-            self._handle_unknown_format(header_data)
+            if self.skip_corrupted:
+                logger.info(f"Skipping demo file with parsing error: {str(e)}")
+            else:
+                raise
     
     def _handle_unknown_format(self, header_data: bytes) -> None:
         """Handle an unknown demo file format"""
@@ -957,45 +1048,198 @@ class DemoParser:
                 raise DemoParserException("Parsing aborted due to invalid user input.")
     
     def _parse_pbdems2_header(self, header_data: bytes) -> None:
-        """Parse the header of a PBDEMS2 demo file"""
+        """Parse PBDEMS2 header with improved string handling"""
         try:
-            # Parse the PBDEMS2 header format
-            magic = header_data[:6].decode('ascii')
-            if magic != "PBDEMS2":
-                raise ValueError(f"Invalid PBDEMS2 magic: {magic}")
+            # Print hex dump for debugging
+            logger.info("Header dump (first 128 bytes):")
+            for i in range(0, min(128, len(header_data)), 16):
+                chunk = header_data[i:i+16]
+                hex_str = ' '.join(f'{b:02x}' for b in chunk)
+                ascii_str = ''.join(chr(b) if 32 <= b <= 126 else '.' for b in chunk)
+                logger.info(f"{i:04x}: {hex_str:48s} {ascii_str}")
 
-            logger.debug("Parsing PBDEMS2 demo header...")
+            # Parse magic string (first 8 bytes)
+            magic = header_data[:8].decode('ascii', errors='replace').strip('\0')
+            if not magic.startswith('PBDEMS'):
+                raise ValueError(f"Invalid PBDEMS magic: {magic}")
 
+            # Parse protocols correctly based on observed format
+            demo_protocol = struct.unpack('<I', header_data[8:12])[0]
+            network_protocol = struct.unpack('<I', header_data[12:16])[0]
+            
+            logger.info(f"Demo Protocol: {demo_protocol}")
+            logger.info(f"Network Protocol: {network_protocol}")
+
+            def safe_extract_string(start_marker: bytes, max_length: int = 64) -> str:
+                """Safely extract a null-terminated string starting with a marker"""
+                try:
+                    start_idx = header_data.find(start_marker)
+                    if start_idx == -1:
+                        return ""
+                    
+                    # Find next null terminator or control character
+                    end_idx = start_idx
+                    for i in range(start_idx, min(start_idx + max_length, len(header_data))):
+                        if header_data[i] < 32:  # Control character or null
+                            end_idx = i
+                            break
+                    
+                    # Extract and clean the string
+                    string_bytes = header_data[start_idx:end_idx]
+                    return string_bytes.decode('ascii', errors='replace').strip()
+                except Exception as e:
+                    logger.warning(f"Error extracting string with marker {start_marker}: {e}")
+                    return ""
+
+            # Extract map name (starts with "de_")
+            map_name = safe_extract_string(b'de_', 32)
+            # Clean up map name - only take up to first non-alphanumeric character
+            map_name = ''.join(c for c in map_name if c.isalnum() or c == '_')
+            logger.info(f"Found map name: {map_name}")
+
+            # Extract server name (starts with "FACEIT")
+            server_name = safe_extract_string(b'FACEIT', 128)
+            logger.info(f"Found server name: {server_name}")
+
+            # Extract game directory (starts with "/home" or "/cs2")
+            game_directory = ""
+            for path_start in [b'/home', b'/cs2']:
+                temp_dir = safe_extract_string(path_start, 256)
+                if temp_dir:
+                    game_directory = temp_dir
+                    break
+            logger.info(f"Found game directory: {game_directory}")
+
+            # Set reasonable defaults for timing values
+            playback_time = 0.0
+            ticks = 0
+            frames = 0
+            signon_length = 0
+
+            # Create header object with parsed values
             self.header = DemoHeader(
                 raw_data=header_data,
                 magic=magic,
-                demo_protocol=struct.unpack('<i', header_data[6:10])[0],
-                network_protocol=struct.unpack('<i', header_data[10:14])[0],
-                server_name=self._read_null_terminated_string(header_data, 14, 142),
-                client_name=self._read_null_terminated_string(header_data, 142, 270),
-                map_name=self._read_null_terminated_string(header_data, 270, 398),
-                game_directory=self._read_null_terminated_string(header_data, 398, 526),
-                playback_time=struct.unpack('<f', header_data[526:530])[0],
-                ticks=struct.unpack('<i', header_data[530:534])[0],
-                frames=struct.unpack('<i', header_data[534:538])[0],
-                signon_length=struct.unpack('<i', header_data[538:542])[0]
+                demo_protocol=demo_protocol,
+                network_protocol=network_protocol,
+                server_name=server_name,
+                client_name="",  # We'll leave this blank for now
+                map_name=map_name,
+                game_directory=game_directory,
+                playback_time=playback_time,
+                ticks=ticks,
+                frames=frames,
+                signon_length=signon_length
             )
 
-            logger.info(f"Parsed PBDEMS2 demo header: {self.header}")
-        except (struct.error, UnicodeDecodeError, ValueError) as e:
-            logger.error(f"Error parsing PBDEMS2 header: {e}")
-            raise DemoParserCorruptedFileException(f"Error parsing PBDEMS2 header: {e}")
-    
-    def _read_null_terminated_string(self, data: bytes, start: int, end: int) -> str:
-        """Read a null-terminated string from the given byte range"""
+            logger.info("Successfully created header object")
+            logger.info(f"Final header values:")
+            logger.info(f"Magic: {self.header.magic}")
+            logger.info(f"Demo Protocol: {self.header.demo_protocol}")
+            logger.info(f"Network Protocol: {self.header.network_protocol}")
+            logger.info(f"Map: {self.header.map_name}")
+            logger.info(f"Server: {self.header.server_name}")
+            logger.info(f"Game Directory: {self.header.game_directory}")
+
+        except Exception as e:
+            logger.error(f"Error parsing PBDEMS header: {e}", exc_info=True)
+            raise
+
+    def _translate_game_events(self, data: bytes, tick: int) -> None:
+        """Translate the game event data"""
+        events = self._decode_packet(data)
+        for event in events:
+            event_type = EventType[event['type']]
+            logger.info(f"Event Type: {event_type.name}")
+            logger.info(f"Tick: {event['tick']}")
+            logger.info(f"Data: {event['data']}")
+
+    def _translate_string_tables(self, data: bytes) -> None:
+        """Translate the string table data"""
         try:
-            null_idx = data.find(b'\x00', start, end)
-            if null_idx == -1:
-                return data[start:end].decode('ascii', errors='replace')
+            offset = 0
+            num_tables = self._read_int(data, offset)
+            offset += 4
+
+            for _ in range(num_tables):
+                table_id = self._read_int(data, offset)
+                offset += 4
+                num_entries = self._read_int(data, offset)
+                offset += 4
+
+                logger.info(f"String Table ID: {table_id}")
+                logger.info(f"Number of Entries: {num_entries}")
+
+                for _ in range(num_entries):
+                    entry_id = self._read_int(data, offset)
+                    offset += 4
+                    string_length = self._read_int(data, offset)
+                    offset += 4
+                    string_value = data[offset:offset+string_length].decode('utf-8', errors='replace')
+                    offset += string_length
+
+                    logger.info(f"Entry ID: {entry_id}")
+                    logger.info(f"String Value: {string_value}")
+
+        except Exception as e:
+            logger.error(f"Error translating string tables: {e}", exc_info=True)
+
+    def _translate_data_tables(self, data: bytes) -> None:
+        """Translate the data table data"""
+        try:
+            offset = 0
+            num_tables = self._read_int(data, offset)
+            offset += 4
+
+            for _ in range(num_tables):
+                table_id = self._read_int(data, offset)
+                offset += 4
+                num_entries = self._read_int(data, offset)
+                offset += 4
+
+                logger.info(f"Data Table ID: {table_id}")
+                logger.info(f"Number of Entries: {num_entries}")
+
+                for _ in range(num_entries):
+                    entry_id = self._read_int(data, offset)
+                    offset += 4
+                    entry_type = self._read_int(data, offset)
+                    offset += 4
+                    entry_size = self._read_int(data, offset)
+                    offset += 4
+                    entry_data = data[offset:offset+entry_size]
+                    offset += entry_size
+
+                    logger.info(f"Entry ID: {entry_id}")
+                    logger.info(f"Entry Type: {entry_type}")
+                    logger.info(f"Entry Size: {entry_size}")
+
+                    # Translate the entry data based on the type
+                    entry_value = self._translate_data_table_entry(entry_type, entry_data)
+                    logger.info(f"Entry Value: {entry_value}")
+
+        except Exception as e:
+            logger.error(f"Error translating data tables: {e}", exc_info=True)
+
+    def _translate_data_table_entry(self, entry_type: int, entry_data: bytes) -> str:
+        """Translate a data table entry based on the entry type"""
+        try:
+            if entry_type == 0:
+                # Parse the entry data as a string
+                return entry_data.decode('utf-8', errors='replace')
+            elif entry_type == 1:
+                # Parse the entry data as an integer
+                return str(self._read_int(entry_data, 0))
+            elif entry_type == 2:
+                # Parse the entry data as a float
+                return str(self._read_float(entry_data, 0))
             else:
-                return data[start:null_idx].decode('ascii', errors='replace')
-        except UnicodeDecodeError:
-            return ''
+                # Unsupported entry type
+                return f"Unknown type: {entry_type}"
+        except Exception as e:
+            logger.warning(f"Error translating data table entry: {e}")
+            return "Error"
+
 
     def _read_message(self, demo_file: BinaryIO) -> Optional[Tuple[DemoMessageType, bytes]]:
         """Read the next message from the demo file"""
@@ -1039,7 +1283,56 @@ class DemoParser:
                 if not packet:
                     break
                 self._process_packet(packet)
-    
+
+
+    def _parse_demo_header(self, demo_file: BinaryIO) -> Optional[DemoHeader]:
+        """Parse the demo file header"""
+        try:
+            # Read the header fields
+            raw_data = demo_file.read(DemoHeader.HEADER_SIZE)
+            if len(raw_data) != DemoHeader.HEADER_SIZE:
+                logger.warning(f"Invalid header size: {len(raw_data)} bytes")
+                return None
+
+            magic = raw_data[:8].decode('utf-8').rstrip('\0')
+            if magic != "HL2DEMO":
+                logger.warning(f"Invalid demo file magic: {magic}")
+                return None
+
+            demo_protocol = self._read_int(raw_data[8:12], 0)
+            network_protocol = self._read_int(raw_data[12:16], 0)
+            server_name = raw_data[16:276].decode('utf-8').rstrip('\0')
+            client_name = raw_data[276:536].decode('utf-8').rstrip('\0')
+            map_name = raw_data[536:796].decode('utf-8').rstrip('\0')
+            game_directory = raw_data[796:1056].decode('utf-8').rstrip('\0')
+            playback_time = self._read_float(raw_data[1056:1060], 0)
+            ticks = self._read_int(raw_data[1060:1064], 0)
+            frames = self._read_int(raw_data[1064:1068], 0)
+            signon_length = self._read_int(raw_data[1068:1072], 0)
+
+            # Create the DemoHeader instance
+            header = DemoHeader(
+                raw_data=raw_data,
+                magic=magic,
+                demo_protocol=demo_protocol,
+                network_protocol=network_protocol,
+                server_name=server_name,
+                client_name=client_name,
+                map_name=map_name,
+                game_directory=game_directory,
+                playback_time=playback_time,
+                ticks=ticks,
+                frames=frames,
+                signon_length=signon_length
+            )
+
+            logger.debug(f"Parsed demo header: {header}")
+            return header
+
+        except Exception as e:
+            logger.error(f"Error parsing demo header: {e}", exc_info=True)
+            return None
+        
     def _handle_event(self, event: Dict[str, Any]):
         """Handle a single game event"""
         event_type = EventType[event['type']]
@@ -1129,6 +1422,44 @@ class DemoParser:
         """Handle a BOMB_DEFUSED event"""
         # Update player state, round state, etc.
         pass
+
+    def _analyze_file_structure(self, demo_file: BinaryIO) -> None:
+        """Analyze overall file structure"""
+        # Save current position
+        current_pos = demo_file.tell()
+
+        try:
+            # Get file size
+            demo_file.seek(0, 2)  # Seek to end
+            file_size = demo_file.tell()
+            demo_file.seek(current_pos)  # Return to original position
+
+            # Read and analyze chunks of file
+            chunk_size = 256
+            position = current_pos
+            
+            logger.info(f"Analyzing file structure from position {current_pos} (file size: {file_size})")
+            
+            while position < file_size and position < current_pos + 1024:  # Look at first 1KB
+                demo_file.seek(position)
+                chunk = demo_file.read(min(chunk_size, file_size - position))
+                
+                # Print chunk info
+                logger.info(f"\nChunk at position {position}:")
+                for i in range(0, len(chunk), 16):
+                    hex_data = chunk[i:i+16]
+                    # Hex view
+                    hex_str = ' '.join(f'{b:02x}' for b in hex_data)
+                    # ASCII view
+                    ascii_str = ''.join(chr(b) if 32 <= b <= 126 else '.' for b in hex_data)
+                    # Offset and data
+                    logger.info(f"{position+i:08x}: {hex_str:48s} {ascii_str}")
+                
+                position += chunk_size
+
+        finally:
+            # Restore original position
+            demo_file.seek(current_pos)
     
     
     def _analyze(self) -> Dict[str, Any]:
@@ -1244,27 +1575,411 @@ class DemoParser:
         except Exception as e:
             logger.error(f"Error saving analysis: {e}")
 
-    def _read_next_packet(self, demo_file: BinaryIO) -> Optional[DemoPacket]:
+    def _resync_to_valid_packet(self, demo_file: BinaryIO) -> Optional[Tuple[int, int, int]]:
+        """Attempt to resynchronize to the next valid packet"""
+        MAX_SCAN_BYTES = 1024 * 1024  # 1MB
+        VALID_TYPES = {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 32}
+        bytes_scanned = 0
+        buffer = bytearray()
+
+        while bytes_scanned < MAX_SCAN_BYTES:
+            byte = demo_file.read(1)
+            if not byte:
+                return None  # EOF
+            bytes_scanned += 1
+            buffer.extend(byte)
+
+            if len(buffer) >= 9:  # Minimum packet header size
+                if self._looks_like_packet_start(buffer[-9:]):
+                    # Found potential packet start
+                    new_pos = demo_file.tell() - 9
+                    demo_file.seek(new_pos)
+                    logger.info(f"Found potential packet at offset {new_pos - bytes_scanned} from scan start")
+                    header = self._read_packet_header(demo_file)
+                    if header:
+                        cmd_type, tick, size = header
+                        if cmd_type in VALID_TYPES:
+                            return cmd_type, tick, size
+                # Keep last 8 bytes for next iteration
+                buffer = buffer[-8:]
+
+        logger.warning(f"Could not find valid packet in {bytes_scanned} bytes")
+        return None
+    
+    def _read_packet(self, demo_file: BinaryIO) -> Optional[DemoPacket]:
+        """Read a standard data packet from the demo file"""
         try:
-            cmd_info = self._read_packet_header(demo_file)
-            if not cmd_info:
+            # Read the packet header
+            header_bytes = demo_file.read(4)
+            packet_size = self._read_int(header_bytes, 0)  # Use 0 as the offset
+
+            if packet_size <= 0:
+                logger.warning(f"Invalid packet size: {packet_size}")
                 return None
 
-            cmd_type, tick, size = cmd_info
-            packet_data = self._read_packet_data(demo_file, size)
-            if not packet_data:
+            packet_data = demo_file.read(packet_size)
+            if len(packet_data) < packet_size:
+                logger.warning(f"Incomplete packet data: expected {packet_size}, got {len(packet_data)}")
                 return None
 
-            return DemoPacket(cmd_type, tick, packet_data)
+            # Determine the packet type from the first byte
+            packet_type = packet_data[0]
 
-        except DemoParserCorruptedFileException as e:
-            logger.error(f"Corrupted demo file: {e}")
-            return None
+            # Create the DemoPacket instance
+            return DemoPacket(
+                cmd_type=packet_type,
+                tick=0,  # Tick information is not always available in the header
+                data=packet_data
+            )
+
         except Exception as e:
             logger.error(f"Error reading packet: {e}", exc_info=True)
             return None
+
+        
+    def _read_bytes(self, demo_file: BinaryIO, size: int) -> bytes:
+        """Reads a specified number of bytes from the demo file."""
+        return demo_file.read(size)
+
+        
+    def _looks_like_packet_start(self, header_bytes: Union[bytes, bytearray]) -> bool:
+        """Check if bytes look like a valid packet header"""
+        if len(header_bytes) < 9:
+            return False
+
+        cmd_type = header_bytes[0]
+        tick = int.from_bytes(header_bytes[1:5], 'little')
+        size = int.from_bytes(header_bytes[5:9], 'little')
+
+        # Known good patterns for PBDEMS2
+        KNOWN_TYPES = {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 32}
+
+        # Command type must be valid
+        if cmd_type not in KNOWN_TYPES:
+            return False
+
+        # Size must be reasonable
+        MAX_REASONABLE_SIZE = 10 * 1024 * 1024  # 10MB absolute max
+        if size <= 0 or size > MAX_REASONABLE_SIZE:
+            return False
+
+        # Tick should be reasonable for most packet types
+        if cmd_type not in {3, 4, 9}:  # Exclude special packets that might have special tick values
+            if tick < 0 or tick > 1000000:  # 1M ticks max
+                return False
+
+        return True
+
+    def _is_reasonable_size(self, size: int, cmd_type: int) -> bool:
+        """Check if packet size is reasonable for the given type"""
+        if size <= 0:
+            return False
+
+        # Different size limits for different packet types
+        if cmd_type == 32:  # PBDEMS_CUSTOMDATA
+            return size <= 10 * 1024 * 1024  # 10MB
+        elif cmd_type in {11, 12}:  # Tables
+            return size <= 5 * 1024 * 1024   # 5MB
+        else:
+            return size <= 1024 * 1024        # 1MB
+    
+    def _is_valid_packet(self, cmd_type: int, tick: int, size: int) -> bool:
+        """Validate packet header values"""
+        # Define valid packet types
+        VALID_TYPES = {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 32}
+        
+        # Type validation
+        if cmd_type not in VALID_TYPES:
+            return False
+            
+        # Tick validation - some packet types can have special tick values
+        if cmd_type not in {3, 4, 9}:  # Normal packets
+            if tick < 0 or tick > 1_000_000:  # Reasonable tick range
+                return False
+                
+        # Size validation - different limits for different types
+        if size <= 0:
+            return False
+            
+        if cmd_type in {11, 12}:  # Table packets
+            MAX_SIZE = 5 * 1024 * 1024  # 5MB
+        elif cmd_type == 32:  # Custom data
+            MAX_SIZE = 10 * 1024 * 1024  # 10MB
+        else:  # Regular packets
+            MAX_SIZE = 1024 * 1024  # 1MB
+            
+        if size > MAX_SIZE:
+            return False
+            
+        return True
+
+    def _read_next_packet(self, demo_file: BinaryIO) -> Optional[DemoPacket]:
+        """Read next packet with enhanced debugging"""
+        # Initialize position
+        current_pos: int = demo_file.tell()
+        
+        try:
+            # First, let's look at a larger chunk of data
+            preview_size = 64  # Look at 64 bytes at a time
+            preview_data = demo_file.read(preview_size)
+            demo_file.seek(current_pos)  # Reset position
+            
+            # Print hex dump of data
+            logger.info(f"\nReading at position {current_pos}:")
+            logger.info("Preview of next 64 bytes:")
+            hex_dump = ' '.join(f'{b:02x}' for b in preview_data)
+            ascii_dump = ''.join(chr(b) if 32 <= b <= 126 else '.' for b in preview_data)
+            logger.info(f"HEX:   {hex_dump}")
+            logger.info(f"ASCII: {ascii_dump}")
+            
+            # Look for common patterns
+            patterns = {
+                'PBDEMS Header': b'PBDEMS',
+                'Command Start': b'\x07\xd0',
+                'Data Start': b'\x01\xf1',
+                'File Info': b'\x04\x00',
+                'String Table': b'\x0c\x00',
+                'Data Table': b'\x0b\x00',
+            }
+            
+            logger.info("\nSearching for known patterns:")
+            for name, pattern in patterns.items():
+                pos = preview_data.find(pattern)
+                if pos != -1:
+                    logger.info(f"Found {name} at offset +{pos}")
+                    
+            # Try to determine packet structure
+            if len(preview_data) >= 4:
+                possible_sizes = []
+                for i in range(len(preview_data)-3):
+                    size = int.from_bytes(preview_data[i:i+4], 'little')
+                    if 0 < size < 1024*1024:  # Reasonable size
+                        possible_sizes.append((i, size))
+                
+                if possible_sizes:
+                    logger.info("\nPossible packet sizes found:")
+                    for offset, size in possible_sizes:
+                        logger.info(f"Offset +{offset}: size = {size}")
+
+            # Try to parse based on what looks like packet headers
+            # First, skip any non-packet data
+            skip_size = 0
+            for i in range(min(32, len(preview_data))):
+                # Look for packet header patterns
+                if (i + 1 < len(preview_data) and 
+                    # Check for known packet type bytes
+                    (preview_data[i] in {0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C} and
+                    preview_data[i+1] == 0x00)):
+                    skip_size = i
+                    break
+                    
+                # Check for PBDEMS2 data marker
+                if (i + 3 < len(preview_data) and 
+                    preview_data[i:i+2] in {b'\x07\xd0', b'\x01\xf1'}):
+                    skip_size = i
+                    break
+            
+            if skip_size > 0:
+                logger.info(f"\nSkipping {skip_size} bytes to potential packet start")
+                demo_file.seek(current_pos + skip_size)
+                
+            # Try to read packet header
+            header_bytes = demo_file.read(4)
+            if len(header_bytes) < 4:
+                logger.info("Not enough bytes for header")
+                return None
+                
+            logger.info(f"\nPotential packet header: {' '.join(f'{b:02x}' for b in header_bytes)}")
+            
+            # Basic packet structure
+            if header_bytes[0] in {0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C}:
+                # Standard packet
+                packet_type = header_bytes[0]
+                size = int.from_bytes(header_bytes[1:4], 'little')
+                
+                logger.info(f"Standard packet: type={packet_type}, size={size}")
+                
+                if 0 < size < 1024*1024:  # Reasonable size
+                    data = demo_file.read(size)
+                    return DemoPacket(cmd_type=packet_type, tick=0, data=data)
+                    
+            elif header_bytes[0:2] in {b'\x07\xd0', b'\x01\xf1'}:
+                # PBDEMS style packet
+                packet_type = header_bytes[2]
+                size = header_bytes[3]
+                
+                logger.info(f"PBDEMS packet: type={packet_type}, size={size}")
+                
+                if 0 < size < 1024*1024:  # Reasonable size
+                    data = demo_file.read(size)
+                    return DemoPacket(cmd_type=packet_type, tick=0, data=data)
+
+            # If we get here, try advancing by 1 and looking again
+            demo_file.seek(current_pos + 1)
+            return None
+
+        except Exception as e:
+            logger.error(f"Error in packet reading at position {current_pos}: {e}")
+            demo_file.seek(current_pos + 1)
+            return None
+        
+    def _peek_bytes(self, demo_file: BinaryIO, num_bytes: int) -> bytes:
+        """Peek at the next bytes without moving file pointer"""
+        pos = demo_file.tell()
+        data = demo_file.read(num_bytes)
+        demo_file.seek(pos)
+        return data
+        
+    def _find_next_packet(self, demo_file: BinaryIO) -> Optional[DemoPacket]:
+        """Find the next valid packet in the file"""
+        MAX_SCAN_BYTES = 1024 * 1024  # Max 1MB scan
+        start_pos = demo_file.tell()
+        bytes_scanned = 0
+        buffer = bytearray()
+
+        while bytes_scanned < MAX_SCAN_BYTES:
+            byte = demo_file.read(1)
+            if not byte:
+                return None  # EOF
+
+            bytes_scanned += 1
+            buffer.extend(byte)
+
+            if len(buffer) >= 9:  # Minimum packet header size
+                if self._looks_like_packet_start(bytes(buffer[-9:])):
+                    # Found potential packet start
+                    new_pos = demo_file.tell() - 9
+                    demo_file.seek(new_pos)
+                    logger.info(f"Found potential packet at offset {new_pos - start_pos} from scan start")
+                    header = self._read_packet_header(demo_file)
+                    if header:
+                        cmd_type, tick, size = header
+                        if self._is_valid_packet_header(cmd_type, tick, size):
+                            return DemoPacket(cmd_type=cmd_type, tick=tick, data=self._read_packet_data(demo_file, size))
+
+                # Keep last 8 bytes for next iteration
+                buffer = buffer[-8:]
+
+        logger.warning(f"Could not find valid packet in {bytes_scanned} bytes")
+        return None
+        
+    def _validate_packet_header(self, cmd_type: int, tick: int, size: int) -> bool:
+        """Validate packet header values with PBDEMS2 support"""
+        # Basic size validation
+        if size < 0:
+            logger.warning(f"Negative packet size: {size}")
+            return False
+
+        # Different size limits for different packet types
+        if cmd_type == 32:  # PBDEMS_CUSTOMDATA
+            MAX_SIZE = 10 * 1024 * 1024  # 10MB
+        else:
+            MAX_SIZE = 1024 * 1024  # 1MB
+
+        if size > MAX_SIZE:
+            logger.warning(f"Packet size too large: {size} > {MAX_SIZE}")
+            return False
+
+        # Tick validation - allow negative ticks for special packets
+        if cmd_type in {3, 4, 9}:  # Header/info/command packets
+            return True
+        if tick < 0 or tick > 1000000:
+            logger.warning(f"Invalid tick number: {tick}")
+            return False
+
+        return True
+        
+    def _read_packet_data(self, demo_file: BinaryIO, size: int) -> bytes:
+        """Read packet data with improved error handling"""
+        if size <= 0:
+            logger.warning(f"Invalid packet size: {size}")
+            return b''
+
+        try:
+            data = bytearray()
+            remaining = size
+            CHUNK_SIZE = 8192  # 8KB chunks
+
+            while remaining > 0:
+                chunk_size = min(remaining, CHUNK_SIZE)
+                chunk = demo_file.read(chunk_size)
+                if not chunk:
+                    logger.warning(f"Incomplete packet data: expected {size}, got {size - remaining}")
+                    return b''  # Return an empty bytes object instead of None
+                data.extend(chunk)
+                remaining -= len(chunk)
+
+                # Log progress for large packets
+                if size > 1024 * 1024:  # 1MB
+                    progress = ((size - remaining) / size) * 100
+                    logger.debug(f"Reading large packet: {progress:.1f}% complete")
+
+            return bytes(data)
+        except Exception as e:
+            logger.error(f"Error reading packet data: {e}", exc_info=True)
+            return b''  # Return an empty bytes object instead of None
+    
+    def _attempt_packet_recovery(self, parser: 'DemoParser', demo_path: str) -> Optional[DemoPacket]:
+        """Attempt to recover from corrupt packet by finding next valid packet"""
+        MAX_RECOVERY_BYTES = 1024 * 1024  # 1MB max recovery scan
+        bytes_scanned = 0
+        buffer = bytearray()
+
+        with open(demo_path, 'rb') as demo_file:
+            while bytes_scanned < MAX_RECOVERY_BYTES:
+                # Read one byte at a time looking for valid packet header
+                byte = demo_file.read(1)
+                if not byte:
+                    return None  # EOF
+                bytes_scanned += 1
+                buffer.extend(byte)
+
+                if len(buffer) >= 9:  # Minimum packet header size
+                    # Try to parse as packet header
+                    header = parser._read_packet_header(demo_file)
+                    if header:
+                        cmd_type, tick, size = header
+                        if parser._is_valid_packet_header(cmd_type, tick, size):
+                            # Found potential valid packet header
+                            logger.info(f"Recovered packet header at offset {bytes_scanned}")
+                            # Reset file position to start of packet
+                            demo_file.seek(-9, 1)
+                            return DemoPacket(cmd_type=cmd_type, tick=tick, data=parser._read_packet_data(demo_file, size))
+
+                # Remove oldest byte if buffer is full
+                buffer = buffer[1:]
+
+        logger.error("Failed to recover valid packet")
+        return None
+            
+    def _parse_packet_header(self, header_data: bytes) -> Optional[Tuple[int, int, int]]:
+        """Parse packet header with validation"""
+        try:
+            cmd_type = header_data[0]  # First byte is command type
+            tick = struct.unpack('<I', header_data[1:5])[0]  # Next 4 bytes are tick number
+            size = struct.unpack('<I', header_data[5:9])[0]  # Last 4 bytes are size
+        
+            # Basic sanity checks
+            if cmd_type > 32:  # Assuming 32 is the max valid command type
+                raise ValueError(f"Invalid command type: {cmd_type}")
+            if tick < 0:
+                raise ValueError(f"Invalid tick number: {tick}")
+            
+            return cmd_type, tick, size
+        except Exception as e:
+            logger.error(f"Error parsing packet header: {e}")
+            return None
+        
+    def _is_valid_packet_size(self, size: int) -> bool:
+        """Validate packet size"""
+        MIN_PACKET_SIZE = 0
+        MAX_PACKET_SIZE = 1024 * 1024 * 10  # 10MB max packet size
+    
+        return MIN_PACKET_SIZE <= size <= MAX_PACKET_SIZE
+
     
     def _read_packet_header(self, demo_file: BinaryIO) -> Optional[Tuple[int, int, int]]:
+        """Parse packet header with validation"""
         try:
             cmd_type_data = demo_file.read(1)
             if not cmd_type_data:
@@ -1281,37 +1996,92 @@ class DemoParser:
                 return None
             size = int.from_bytes(size_data, byteorder='little')
 
-            return (cmd_type, tick, size)
+            # Validate packet header
+            if not self._is_valid_packet_header(cmd_type, tick, size):
+                logger.warning(f"Invalid packet header: type={cmd_type}, tick={tick}, size={size}")
+                return None
 
-        except EOFError:
-            return None
+            return cmd_type, tick, size
         except Exception as e:
             logger.error(f"Error reading packet header: {e}", exc_info=True)
-            raise DemoParserCorruptedFileException(f"Invalid packet header: {e}")
-    
-    def _read_packet_data(self, demo_file: BinaryIO, size: int) -> bytes:
-        packet_data = b''
+            return None
+        
+    def _is_valid_packet_header(self, cmd_type: int, tick: int, size: int) -> bool:
+        """Validate packet header values"""
+        # Define valid packet types
+        VALID_TYPES = {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 32}
 
-        try:
-            bytes_read = 0
-            while bytes_read < size:
-                chunk = demo_file.read(min(size - bytes_read, self.MAX_PACKET_SIZE))
-                if not chunk:
-                    logger.warning(f"Incomplete packet data: expected {size} bytes, got {bytes_read} for file: {self.demo_path}")
-                    return packet_data
-                packet_data += chunk
-                bytes_read += len(chunk)
-            return packet_data
-        except Exception as e:
-            logger.error(f"Error reading packet data for file: {self.demo_path}: {e}", exc_info=True)
-            raise
+        # Type validation
+        if cmd_type not in VALID_TYPES:
+            return False
+
+        # Tick validation - some packet types can have special tick values
+        if cmd_type not in {3, 4, 9}:  # Normal packets
+            if tick < 0 or tick > 1_000_000:  # Reasonable tick range
+                return False
+
+        # Size validation - different limits for different types
+        if size <= 0:
+            return False
+
+        if cmd_type in {11, 12}:  # Table packets
+            MAX_SIZE = 5 * 1024 * 1024  # 5MB
+        elif cmd_type == 32:  # Custom data
+            MAX_SIZE = 10 * 1024 * 1024  # 10MB
+        else:  # Regular packets
+            MAX_SIZE = 1024 * 1024  # 1MB
+
+        if size > MAX_SIZE:
+            return False
+
+        return True
+
 
     def _process_packet(self, packet: DemoPacket) -> None:
-        handler = self._message_type_handlers.get(packet.cmd_type)
-        if handler:
-            handler.handle_packet(packet)
-        else:
-            logger.warning(f"Unsupported message type: {packet.cmd_type}")
+        try:
+            if packet.cmd_type == 7:  # Command packet
+                self._handle_command_packet(packet.data)
+            else:  # Data packet
+                self._handle_data_packet(packet.data)
+        except Exception as e:
+            logger.error(f"Error processing packet: {e}")
+            self._translate_packet_data(packet)
+            self._attempt_packet_recovery(self, self.demo_path)
+
+    def _translate_packet_data(self, packet: DemoPacket) -> None:
+        """Translate the raw packet data into human-readable format"""
+        try:
+            cmd_type = DemoPacketType.get_name(packet.cmd_type)
+            logger.info(f"Packet Type: {cmd_type}")
+            logger.info(f"Tick: {packet.tick}")
+
+            # Translate the packet data
+            data_bytes = packet.data
+            data_str = ' '.join(f'{b:02X}' for b in data_bytes)
+            logger.info(f"Packet Data (hex): {data_str}")
+
+            # Try to parse the data based on the packet type
+            if cmd_type == 'DEM_PACKET':
+                self._translate_game_events(data_bytes, packet.tick)
+            elif cmd_type == 'DEM_STRINGTABLES':
+                self._translate_string_tables(data_bytes)
+            elif cmd_type == 'DEM_DATATABLES':
+                self._translate_data_tables(data_bytes)
+            else:
+                logger.info(f"Packet data (ASCII): {data_bytes.decode('ascii', errors='replace')}")
+
+        except Exception as e:
+            logger.error(f"Error translating packet data: {e}", exc_info=True)
+        
+    class CustomDataHandler(DemoMessageTypeHandler):
+        def handle_packet(self, packet: DemoPacket) -> None:
+            """Handle custom data packets (type 32)"""
+            try:
+                # Add your custom data handling logic here
+                # For now, just log the data size
+                logger.debug(f"Received custom data packet: {len(packet.data)} bytes")
+            except Exception as e:
+                logger.error(f"Error handling custom data packet: {e}")
     
     def _read_cmd_info(self, demo_file: BinaryIO) -> Optional[Tuple[int, int, int]]:
         """Read command info from demo file"""
@@ -1335,6 +2105,19 @@ class DemoParser:
             
         except EOFError:
             return None
+        
+    def _handle_data_packet(self, data: bytes) -> None:
+        """Handle PBDEMS data packet"""
+        if len(data) < 4:
+            return
+            
+        try:
+            packet_type = data[0]
+            logger.debug(f"Processing data packet type {packet_type}")
+            # Add data packet handling here
+            pass
+        except Exception as e:
+            logger.error(f"Error handling data packet: {e}")
         
     def _create_packet(self, cmd_type: int, tick: int, data: bytes) -> bytes:
         """Create a packet with header and data"""
@@ -1513,15 +2296,12 @@ class DemoParser:
             return {
                 'winner': int.from_bytes(data[0:4], byteorder='little'),
                 'reason': int.from_bytes(data[4:8], byteorder='little'),
-                'message': self._read_string(data[8:])
+                'message': self._read_string(data[8:], 10)  # Updated to call _read_string directly on bytes
             }
         except Exception as e:
-            logger.error(f"Error parsing round end event: {e}")
-            return {
-                'winner': 0,
-                'reason': 0,
-                'message': ''
-            }
+            logger.error(f"Error parsing round end event: {e}", exc_info=True)
+            return {}
+
 
     def _parse_smoke_event(self, data: bytes) -> Dict[str, Any]:
         """Parse smoke grenade event data"""
@@ -1720,25 +2500,12 @@ class DemoParser:
             'duration': struct.unpack('<f', data[16:20])[0]
         }
 
-    def _read_string(self, data: bytes, offset: int = 0) -> str:
-        """
-        Read a null-terminated string from byte data
-    
-        Args:
-            data: Raw bytes containing string data
-            offset: Starting position in bytes
-        
-        Returns:
-            str: Decoded string, empty string if error
-        """
-        try:
-            end = data.find(b'\x00', offset)
-            if end == -1:  # No null terminator found
-                return data[offset:].decode('ascii', errors='replace')
-            return data[offset:end].decode('ascii', errors='replace')
-        except Exception as e:
-            logger.error(f"Error reading string at offset {offset}: {e}")
-            return ''
+    def _read_string(self, data: bytes, length: Optional[int] = None) -> str:
+        """Read a fixed-length string from byte data, or until end if length is None."""
+        if length is None:
+            length = len(data)
+        buffer = data[:length]  # Slice to the specified length
+        return buffer.decode('ascii', errors='replace').strip('\0')
     
     def _read_float(self, data: bytes, offset: int) -> float:
         """Read a 32-bit float from byte data"""
@@ -1859,20 +2626,60 @@ class DemoParser:
             # Unsupported entry type
             logger.warning(f"Unsupported data table entry type: {entry_type}")
             return None
-    def parse(self) -> Dict[str, Any]:
+    def _parse(self) -> Dict[str, Any]:
+        """Parse the demo file"""
         try:
-            self._parse_demo()
-            return self._analyze()
-        except DemoParserCorruptedFileException as e:
-            logger.error(f"Error parsing demo: {e}")
-            if self.skip_corrupted:
-                logger.info(f"Skipping corrupted demo file: {self.demo_path}")
-                return {}
-            else:
-                raise
+            with open(self.demo_path, 'rb') as demo_file:
+                # Parse the demo header
+                self.header = self._parse_demo_header(demo_file)
+                if not self.header:
+                    raise ValueError("Failed to parse demo header")
+
+                # Process packets
+                packets_processed = 0
+                errors_encountered = 0
+                while True:
+                    packet = self._read_packet(demo_file)
+                    if not packet:
+                        if errors_encountered > 100:
+                            logger.error("Too many errors, stopping parse")
+                            break
+                        else:
+                            errors_encountered += 1
+                            continue
+                    self._process_packet(packet)
+                    packets_processed += 1
+
+                # Perform analysis
+                analysis = {
+                    'total_packets_processed': packets_processed,
+                    'total_errors_encountered': errors_encountered,
+                    'final_position': demo_file.tell(),
+                    'file_size': os.path.getsize(self.demo_path)
+                }
+
+                return {
+                    'header': self.header.to_dict(),
+                    'statistics': analysis
+                }
+
         except Exception as e:
-            logger.error(f"Unexpected error parsing demo: {e}", exc_info=True)
+            logger.error(f"Error parsing demo: {e}", exc_info=True)
             return {}
+        
+    def _read_line(self, demo_file: BinaryIO) -> Optional[bytes]:
+        """Read a line of text from the demo file"""
+        line = b''
+        while True:
+            char = demo_file.read(1)
+            if not char or char == b'\n':
+                return line
+            line += char
+    
+        
+    def _is_valid_ip_port(self, address: str) -> bool:
+        """Check if the given address is a valid IP:Port format"""
+        return bool(re.match(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d{1,5}', address))
             
 def main():
     if len(sys.argv) > 1:
@@ -1889,7 +2696,7 @@ def main():
 
     try:
         parser = DemoParser(demo_path)
-        analysis = parser.parse()
+        analysis = parser._parse()
 
         # Print results
         print("\nDemo Analysis Results:")
