@@ -244,36 +244,11 @@ class DemoPacketType:
     DEM_USERCMD = 10
     DEM_DATATABLES = 11
     DEM_STRINGTABLES = 12
-    DEM_USERDATA = 13
-    DEM_CUSTOMDATA = 14
-    DEM_STRINGCMD = 15
-    DEM_SVCMD = 16
-    DEM_VOICEDATA = 17
     PBDEMS_CUSTOMDATA = 32
 
-    @classmethod
-    def is_valid(cls, cmd_type: int) -> bool:
-        """Check if a command type is valid"""
-        return cmd_type in {
-            cls.DEM_STOP,
-            cls.DEM_FILEHEADER,
-            cls.DEM_FILEINFO,
-            cls.DEM_SYNCTICK,
-            cls.DEM_MESSAGE,
-            cls.DEM_PACKET,
-            cls.DEM_SIGNONPACKET,
-            cls.DEM_CONSOLECMD,
-            cls.DEM_USERCMD,
-            cls.DEM_DATATABLES,
-            cls.DEM_STRINGTABLES,
-            cls.DEM_USERDATA,
-            cls.DEM_CUSTOMDATA,
-            cls.DEM_STRINGCMD,
-            cls.DEM_SVCMD,
-            cls.DEM_VOICEDATA,
-            cls.PBDEMS_CUSTOMDATA,
-        }
-
+    # Add these two class variables we use in validation
+    VALID_TYPES = {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 32}
+    MAX_SIZE = 10 * 1024 * 1024  # 10MB max packet size
     @classmethod
     def get_name(cls, cmd_type: int) -> str:
         """Get the name of a command type"""
@@ -1056,6 +1031,7 @@ class DemoHeader:
             f"Duration: {self.playback_time:.2f}s\n"
             f"Ticks: {self.ticks}"
         )
+
 class DemoParser:
     """CS2 Demo Parser with comprehensive analysis capabilities"""
 
@@ -1655,14 +1631,64 @@ class DemoParser:
             logger.error(f"Error reading message: {e}")
             return None
 
-    def _parse_demo(self) -> None:
-        with open(self.demo_path, 'rb') as demo_file:
-            self._read_header(demo_file)
-            while True:
-                packet = self._read_pbdems2_packet(demo_file)
-                if not packet:
-                    break
-                self._process_packet(demo_file, packet)
+    def _parse_demo(self) -> Dict[str, Any]:
+        """Improved demo parsing with better error handling"""
+        try:
+            with open(self.demo_path, 'rb') as demo_file:
+                # Parse header
+                header = self._parse_demo_header(demo_file)
+                if not header:
+                    raise DemoParserException("Failed to parse demo header")
+                    
+                self.header = header
+                
+                # Track state
+                current_round = 0
+                events = []
+                rounds = []
+                
+                # Read packets
+                while True:
+                    packet = self._read_pbdems2_packet(demo_file)
+                    if not packet:
+                        break
+                        
+                    # Process packet based on type
+                    if packet.cmd_type == DemoPacketType.DEM_PACKET:
+                        new_events = self._decode_packet(packet.data)
+                        events.extend(new_events)
+                        
+                        # Update round state
+                        for event in new_events:
+                            if event.get('type') == 'ROUND_START':
+                                current_round += 1
+                                rounds.append({
+                                    'number': current_round,
+                                    'start_tick': packet.tick,
+                                    'events': []
+                                })
+                            if rounds:
+                                rounds[-1]['events'].append(event)
+                                
+                    elif packet.cmd_type == DemoPacketType.DEM_STOP:
+                        break
+                        
+                return {
+                    'header': self.header.to_dict(),
+                    'total_rounds': len(rounds),
+                    'total_events': len(events),
+                    'map': self.header.map_name,
+                    'rounds': rounds
+                }
+                
+        except Exception as e:
+            logger.error(f"Error parsing demo: {e}", exc_info=True)
+            return {
+                'error': str(e),
+                'map': getattr(self.header, 'map_name', 'Unknown'),
+                'total_rounds': 0,
+                'total_events': 0
+            }
 
 
     def _parse_demo_header(self, demo_file: BinaryIO) -> Optional[DemoHeader]:
@@ -2453,43 +2479,6 @@ class DemoParser:
         except Exception as e:
             logger.error(f"Error reading packet header: {e}", exc_info=True)
             return None
-
-
-    def _process_packet(self, demo_file: BinaryIO, packet: DemoPacket) -> None:
-        try:
-            if packet.cmd_type == 7:  # Command packet
-                self._handle_command_packet(packet.data)
-            else:  # Data packet
-                self._handle_data_packet(packet.data)
-        except Exception as e:
-            logger.error(f"Error processing packet: {e}")
-            self._translate_packet_data(packet)
-            self._attempt_packet_recovery(demo_file)
-
-    def _translate_packet_data(self, packet: DemoPacket) -> None:
-        """Translate the raw packet data into human-readable format"""
-        try:
-            cmd_type = DemoPacketType.get_name(packet.cmd_type)
-            logger.info(f"Packet Type: {cmd_type}")
-            logger.info(f"Tick: {packet.tick}")
-
-            # Translate the packet data
-            data_bytes = packet.data
-            data_str = ' '.join(f'{b:02X}' for b in data_bytes)
-            logger.info(f"Packet Data (hex): {data_str}")
-
-            # Try to parse the data based on the packet type
-            if cmd_type == 'DEM_PACKET':
-                self._translate_game_events(data_bytes, packet.tick)
-            elif cmd_type == 'DEM_STRINGTABLES':
-                self._translate_string_tables(data_bytes)
-            elif cmd_type == 'DEM_DATATABLES':
-                self._translate_data_tables(data_bytes)
-            else:
-                logger.info(f"Packet data (ASCII): {data_bytes.decode('ascii', errors='replace')}")
-
-        except Exception as e:
-            logger.error(f"Error translating packet data: {e}", exc_info=True)
         
     class CustomDataHandler(DemoMessageTypeHandler):
         def handle_packet(self, packet: DemoPacket) -> None:
@@ -2557,84 +2546,78 @@ class DemoParser:
             if len(packet) < 9:
                 logger.warning("Packet too short for header")
                 return events
-            
+                
+            # First try to parse as PBDEMS2 format
+            if packet.startswith(b'PBDM'):
+                msg_type = packet[4]
+                msg_size = int.from_bytes(packet[5:9], byteorder='little')
+                data = packet[9:]
+                
+                if len(data) < msg_size:
+                    logger.warning(f"Incomplete PBDEMS2 message: expected {msg_size} bytes, got {len(data)}")
+                    return events
+                    
+                # Handle PBDEMS2 message types
+                if msg_type == 1:  # Game event
+                    events.extend(self._decode_game_events(data))
+                elif msg_type == 4:  # String table
+                    self._update_string_tables(data)
+                elif msg_type == 8:  # Data table
+                    self._update_data_tables(data)
+                    
+                return events
+                
+            # Try parsing as standard packet format
             cmd_type, tick, size = struct.unpack('<BII', packet[:9])
             data = packet[9:]
             
             if len(data) < size:
                 logger.warning(f"Incomplete packet data: expected {size} bytes, got {len(data)}")
                 return events
-            
-            # Handle different message types
+                
+            # Handle standard message types
             if cmd_type == DemoMessageType.DEM_PACKET.value:
-                events.extend(self._parse_game_events(data, tick))
+                # Game play packet
+                if data.startswith(b'\x07\xD0') or data.startswith(b'\x01\xF1'):
+                    # CS2 command packet
+                    cmd_header = data[2]
+                    cmd_size = int.from_bytes(data[3:7], byteorder='little')
+                    cmd_data = data[7:7+cmd_size]
+                    
+                    if len(cmd_data) >= cmd_size:
+                        events.extend(self._decode_game_events(cmd_data))
+                else:
+                    # Standard game packet
+                    events.extend(self._decode_game_events(data))
+                    
             elif cmd_type == DemoMessageType.DEM_STRINGTABLES.value:
                 self._update_string_tables(data)
+                
             elif cmd_type == DemoMessageType.DEM_DATATABLES.value:
                 self._update_data_tables(data)
-            
+                
+            elif cmd_type == DemoMessageType.DEM_STOP.value:
+                logger.info("Reached end of demo")
+                
         except Exception as e:
             logger.error(f"Error decoding packet: {e}", exc_info=True)
-        
-        return events
-    
-    def _parse_game_events(self, data: bytes, tick: int) -> List[Dict[str, Any]]:
-        """
-        Parse game events from packet data
-        
-        Args:
-            data: Raw event data
-            tick: Current tick number
+            # Log detailed packet info for debugging
+            logger.debug(f"Packet hex dump: {' '.join(f'{b:02x}' for b in packet[:32])}")
             
-        Returns:
-            List[Dict[str, Any]]: List of parsed events
-        """
-        events = []
-        offset = 0
-        
-        try:
-            while offset + 2 < len(data):
-                # Read event header
-                event_type = int.from_bytes(data[offset:offset+1], byteorder='little')
-                event_size = int.from_bytes(data[offset+1:offset+2], byteorder='little')
-                
-                # Validate event size
-                if event_size <= 0 or offset + 2 + event_size > len(data):
-                    logger.warning(f"Invalid event size {event_size} at offset {offset}")
-                    break
-                
-                # Extract event data
-                event_data = data[offset+2:offset+2+event_size]
-                
-                # Parse event
-                try:
-                    event_type_enum = EventType.from_id(event_type)
-                    parsed_data = self._parse_event_data(event_type_enum, event_data)
-                    
-                    if parsed_data is not None:
-                        event = {
-                            'tick': tick,
-                            'type': event_type_enum.name,
-                            'data': parsed_data
-                        }
-                        
-                        # Add position if event type requires it
-                        if event_type_enum.requires_position:
-                            position = self._read_vector(event_data)
-                            if position:
-                                event['position'] = position.to_dict()
-                        
-                        events.append(event)
-                    
-                except Exception as e:
-                    logger.error(f"Error parsing event type {event_type}: {e}", exc_info=True)
-                
-                offset += 2 + event_size
-                
-        except Exception as e:
-            logger.error(f"Error parsing game events: {e}", exc_info=True)
-        
         return events
+
+    def _read_varint(self, data: bytes, offset: int) -> Tuple[int, int]:
+        """Read a varint from data starting at offset, return (value, new_offset)"""
+        value = 0
+        shift = 0
+        while offset < len(data):
+            byte = data[offset]
+            value |= (byte & 0x7F) << shift
+            offset += 1
+            if not (byte & 0x80):
+                break
+            shift += 7
+        return value, offset
 
     def _read_vector(self, data: bytes, offset: int = 0) -> Optional[Vector3]:
         """
@@ -2670,55 +2653,62 @@ class DemoParser:
             logger.error(f"Error reading vector: {e}")
             return None
     
-    def _parse_event_data(self, event_type: EventType, data: bytes) -> Optional[Dict[str, Any]]:
-        """
-        Parse event data based on event type
-    
-        Args:
-            event_type: Type of event to parse
-            data: Raw event data bytes
-        
-        Returns:
-            Optional[Dict[str, Any]]: Parsed event data or None if parsing failed
-        """
+    def _parse_event_data(self, data: bytes, event_type: int) -> Optional[Dict[str, Any]]:
+        """Parse CS2 game event data based on event type"""
         try:
-            # Map event types to their specific parsers
-            event_parsers = {
-                EventType.ROUND_START: self._parse_round_start_event,
-                EventType.ROUND_END: self._parse_round_end_event,
-                EventType.BOMB_PLANTED: self._parse_bomb_planted_event,
-                EventType.BOMB_DEFUSED: self._parse_bomb_defused_event,
-                EventType.PLAYER_DEATH: self._parse_player_death_event,
-                EventType.PLAYER_POSITION: self._parse_player_position_event,
-                EventType.SMOKE_START: self._parse_smoke_event,
-                EventType.FLASH_EXPLODE: self._parse_flash_event,
-                EventType.MOLOTOV_DETONATE: self._parse_molotov_event,
-                EventType.GAME_START: self._parse_game_phase_change_event
-            }
-        
-            # Get appropriate parser
-            parser = event_parsers.get(event_type)
-            if parser:
-                return parser(data)
+            if event_type == EventType.ROUND_START.value:
+                return self._parse_round_start_event(data)
+            elif event_type == EventType.ROUND_END.value:
+                return self._parse_round_end_event(data)
+            elif event_type == EventType.PLAYER_DEATH.value:
+                return self._parse_player_death_event(data)
+            elif event_type == EventType.PLAYER_HURT.value:
+                return self._parse_player_hurt_event(data)
+            elif event_type == EventType.PLAYER_TEAM.value:
+                return self._parse_player_team_event(data)
+            elif event_type == EventType.BOMB_PLANTED.value:
+                return self._parse_bomb_planted_event(data)
+            elif event_type == EventType.BOMB_DEFUSED.value:
+                return self._parse_bomb_defused_event(data)
+            elif event_type == EventType.WEAPON_FIRE.value:
+                return self._parse_weapon_fire_event(data)
             else:
-                logger.debug(f"No specific parser for event type {event_type.name}")
-                return {}
+                return self._parse_generic_event(data)
 
         except Exception as e:
-            logger.error(f"Error parsing event data for {event_type.name}: {e}", exc_info=True)
+            logger.error(f"Error parsing event type {event_type}: {e}", exc_info=True)
             return None
 
     def _parse_round_end_event(self, data: bytes) -> Dict[str, Any]:
         """Parse round end event data"""
         try:
-            return {
-                'winner': int.from_bytes(data[0:4], byteorder='little'),
-                'reason': int.from_bytes(data[4:8], byteorder='little'),
-                'message': self._read_string(data[8:], 10)  # Updated to call _read_string directly on bytes
-            }
+            offset = 0
+            event_data = {}
+            
+            # Read winner team
+            if offset < len(data):
+                winner, offset = self._read_varint(data, offset)
+                event_data['winner'] = Team(winner).name if winner in Team._value2member_map_ else 'UNKNOWN'
+                
+            # Read reason
+            if offset < len(data):
+                reason, offset = self._read_varint(data, offset)
+                event_data['reason'] = reason
+                
+            # Read message (if any)
+            if offset < len(data):
+                message, offset = self._read_string(data, offset)
+                event_data['message'] = message
+                
+            # Read round number
+            if offset < len(data):
+                round_num, offset = self._read_varint(data, offset)
+                event_data['round_number'] = round_num
+                
+            return event_data
         except Exception as e:
-            logger.error(f"Error parsing round end event: {e}", exc_info=True)
-            return {}
+            logger.error(f"Error parsing round end event: {e}")
+            return {'winner': 'UNKNOWN', 'reason': 0, 'message': '', 'round_number': 0}
 
 
     def _parse_smoke_event(self, data: bytes) -> Dict[str, Any]:
@@ -2772,25 +2762,6 @@ class DemoParser:
             'angle_y': struct.unpack('<f', data[20:24])[0]
         }
     
-    def _parse_player_death(self, data: bytes) -> Dict[str, Any]:
-        """Parse player death event data"""
-        return {
-            'victim_id': int.from_bytes(data[0:4], byteorder='little'),
-            'killer_id': int.from_bytes(data[4:8], byteorder='little'),
-            'weapon': self._read_string(data[8:]),
-            'headshot': bool(data[-1])
-        }
-    
-    def _parse_bomb_planted(self, data: bytes) -> Dict[str, Any]:
-        """Parse bomb planted event data"""
-        return {
-            'player_id': int.from_bytes(data[0:4], byteorder='little'),
-            'site': chr(data[4]),  # 'A' or 'B'
-            'x': struct.unpack('<f', data[5:9])[0],
-            'y': struct.unpack('<f', data[9:13])[0],
-            'z': struct.unpack('<f', data[13:17])[0]
-        }
-    
     def _parse_utility_event(self, data: bytes) -> Dict[str, Any]:
         """Parse utility event data"""
         return {
@@ -2809,6 +2780,77 @@ class DemoParser:
             'z': struct.unpack('<f', data[12:16])[0],
             'duration': struct.unpack('<f', data[16:20])[0]
         }
+
+    def _parse_generic_event(self, data: bytes) -> Dict[str, Any]:
+        """Parse a generic game event"""
+        event_data = {}
+        offset = 0
+        
+        while offset < len(data):
+            # Read field header
+            if offset + 1 > len(data):
+                break
+                
+            field_header = data[offset]
+            field_number = field_header >> 3
+            wire_type = field_header & 0x07
+            offset += 1
+            
+            # Parse field value based on wire type
+            if wire_type == 0:  # Varint
+                value = 0
+                shift = 0
+                while offset < len(data):
+                    byte = data[offset]
+                    value |= (byte & 0x7F) << shift
+                    offset += 1
+                    if not (byte & 0x80):
+                        break
+                    shift += 7
+                event_data[f'field_{field_number}'] = value
+                
+            elif wire_type == 1:  # 64-bit
+                if offset + 8 > len(data):
+                    break
+                value = int.from_bytes(data[offset:offset + 8], byteorder='little')
+                event_data[f'field_{field_number}'] = value
+                offset += 8
+                
+            elif wire_type == 2:  # Length-delimited
+                length = 0
+                shift = 0
+                while offset < len(data):
+                    byte = data[offset]
+                    length |= (byte & 0x7F) << shift
+                    offset += 1
+                    if not (byte & 0x80):
+                        break
+                    shift += 7
+                    
+                if offset + length > len(data):
+                    break
+                    
+                value = data[offset:offset + length]
+                try:
+                    # Try to decode as UTF-8 string
+                    event_data[f'field_{field_number}'] = value.decode('utf-8')
+                except UnicodeDecodeError:
+                    # Store as bytes if not valid UTF-8
+                    event_data[f'field_{field_number}'] = value.hex()
+                offset += length
+                
+            elif wire_type == 5:  # 32-bit
+                if offset + 4 > len(data):
+                    break
+                value = int.from_bytes(data[offset:offset + 4], byteorder='little')
+                event_data[f'field_{field_number}'] = value
+                offset += 4
+                
+            else:
+                # Unknown wire type, skip field
+                break
+                
+        return event_data
     
     def _parse_game_phase_change_event(self, event_data: bytes) -> Optional[Dict[str, Any]]:
         """Parse GAME_PHASE_CHANGE event data"""
@@ -2824,73 +2866,236 @@ class DemoParser:
     def _parse_round_start_event(self, data: bytes) -> Dict[str, Any]:
         """Parse round start event data"""
         try:
-            objective_byte = data[8:9]  # Get a single byte as bytes, not int
-            return {
-                'timelimit': int.from_bytes(data[0:4], byteorder='little'),
-                'fraglimit': int.from_bytes(data[4:8], byteorder='little'),
-                'objective': objective_byte.decode('ascii')
-            }
+            offset = 0
+            event_data = {}
+            
+            # Read timelimit
+            if offset < len(data):
+                timelimit, offset = self._read_varint(data, offset)
+                event_data['timelimit'] = timelimit
+                
+            # Read fraglimit
+            if offset < len(data):
+                fraglimit, offset = self._read_varint(data, offset)
+                event_data['fraglimit'] = fraglimit
+                
+            # Read objective
+            if offset < len(data):
+                objective, offset = self._read_string(data, offset)
+                event_data['objective'] = objective
+                
+            # Read round number
+            if offset < len(data):
+                round_num, offset = self._read_varint(data, offset)
+                event_data['round_number'] = round_num
+                
+            return event_data
         except Exception as e:
             logger.error(f"Error parsing round start event: {e}")
-            return {
-                'timelimit': 0,
-                'fraglimit': 0,
-                'objective': ''
-            }
+            return {'timelimit': 0, 'fraglimit': 0, 'objective': '', 'round_number': 0}
+
 
     def _parse_bomb_planted_event(self, data: bytes) -> Dict[str, Any]:
         """Parse bomb planted event data"""
-        return {
-            'player_id': int.from_bytes(data[0:4], byteorder='little'),
-            'site': chr(data[4]),
-            'x': struct.unpack('<f', data[5:9])[0],
-            'y': struct.unpack('<f', data[9:13])[0],
-            'z': struct.unpack('<f', data[13:17])[0]
-        }
+        try:
+            offset = 0
+            event_data = {}
+            
+            # Read player ID
+            if offset < len(data):
+                player_id, offset = self._read_varint(data, offset)
+                event_data['player_id'] = player_id
+                
+            # Read site (A = 0, B = 1)
+            if offset < len(data):
+                site, offset = self._read_varint(data, offset)
+                event_data['site'] = 'A' if site == 0 else 'B'
+                
+            # Read position coordinates
+            if offset + 12 <= len(data):
+                x = struct.unpack('<f', data[offset:offset+4])[0]
+                y = struct.unpack('<f', data[offset+4:offset+8])[0]
+                z = struct.unpack('<f', data[offset+8:offset+12])[0]
+                event_data['position'] = Position(x, y, z)
+                offset += 12
+                
+            return event_data
+        except Exception as e:
+            logger.error(f"Error parsing bomb planted event: {e}")
+            return {'player_id': 0, 'site': 'UNKNOWN'}
+
     def _parse_bomb_defused_event(self, data: bytes) -> Dict[str, Any]:
         """Parse bomb defused event data"""
-        return {
-            'player_id': int.from_bytes(data[0:4], byteorder='little'),
-            'site': chr(data[4]),
-            'x': struct.unpack('<f', data[5:9])[0],
-            'y': struct.unpack('<f', data[9:13])[0],
-            'z': struct.unpack('<f', data[13:17])[0]
-        }
-    
-    def _parse_player_death_event(self, event_data: bytes) -> Optional[Dict[str, Any]]:
-        """Parse PLAYER_DEATH event data"""
         try:
-            victim_id = self._read_int(event_data, 0)
-            killer_id = self._read_int(event_data, 4)
-            assister_id = self._read_int(event_data, 8)
-            victim_health = self._read_int(event_data, 12)
-            killer_health = self._read_int(event_data, 16)
-            assister_health = self._read_int(event_data, 20)
-            victim_armor = self._read_int(event_data, 24)
-            killer_armor = self._read_int(event_data, 28)
-            assister_armor = self._read_int(event_data, 32)
-            victim_position = self._read_position(event_data, 36)
-            killer_position = self._read_position(event_data, 48)
-            assister_position = self._read_position(event_data, 60)
-            is_headshot = self._read_bool(event_data, 72)
-            return {
-                'victim_id': victim_id,
-                'killer_id': killer_id,
-                'assister_id': assister_id,
-                'victim_health': victim_health,
-                'killer_health': killer_health,
-                'assister_health': assister_health,
-                'victim_armor': victim_armor,
-                'killer_armor': killer_armor,
-                'assister_armor': assister_armor,
-                'victim_position': victim_position.to_dict(),
-                'killer_position': killer_position.to_dict(),
-                'assister_position': assister_position.to_dict(),
-                'is_headshot': is_headshot
-            }
+            offset = 0
+            event_data = {}
+            
+            # Read player ID
+            if offset < len(data):
+                player_id, offset = self._read_varint(data, offset)
+                event_data['player_id'] = player_id
+                
+            # Read site
+            if offset < len(data):
+                site, offset = self._read_varint(data, offset)
+                event_data['site'] = 'A' if site == 0 else 'B'
+                
+            # Read position
+            if offset + 12 <= len(data):
+                x = struct.unpack('<f', data[offset:offset+4])[0]
+                y = struct.unpack('<f', data[offset+4:offset+8])[0]
+                z = struct.unpack('<f', data[offset+8:offset+12])[0]
+                event_data['position'] = Position(x, y, z)
+                
+            return event_data
         except Exception as e:
-            logger.error(f"Error parsing PLAYER_DEATH event data: {e}")
-            return None
+            logger.error(f"Error parsing bomb defused event: {e}")
+            return {'player_id': 0, 'site': 'UNKNOWN'}
+
+    def _parse_weapon_fire_event(self, data: bytes) -> Dict[str, Any]:
+        """Parse weapon fire event data"""
+        try:
+            offset = 0
+            event_data = {}
+            
+            # Read player ID
+            if offset < len(data):
+                player_id, offset = self._read_varint(data, offset)
+                event_data['player_id'] = player_id
+                
+            # Read weapon name
+            if offset < len(data):
+                weapon, offset = self._read_string(data, offset)
+                event_data['weapon'] = weapon
+                
+            # Read ammo
+            if offset < len(data):
+                ammo, offset = self._read_varint(data, offset)
+                event_data['ammo'] = ammo
+                
+            return event_data
+        except Exception as e:
+            logger.error(f"Error parsing weapon fire event: {e}")
+            return {'player_id': 0, 'weapon': '', 'ammo': 0}
+    
+    def _parse_player_death_event(self, data: bytes) -> Dict[str, Any]:
+        """Parse player death event data"""
+        try:
+            offset = 0
+            event_data = {}
+            
+            # Read victim ID
+            if offset < len(data):
+                victim_id, offset = self._read_varint(data, offset)
+                event_data['victim_id'] = victim_id
+                
+            # Read attacker ID
+            if offset < len(data):
+                attacker_id, offset = self._read_varint(data, offset)
+                event_data['attacker_id'] = attacker_id
+                
+            # Read assister ID (if any)
+            if offset < len(data):
+                assister_id, offset = self._read_varint(data, offset)
+                event_data['assister_id'] = assister_id
+                
+            # Read weapon string
+            if offset < len(data):
+                weapon, offset = self._read_string(data, offset)
+                event_data['weapon'] = weapon
+                
+            # Read headshot boolean
+            if offset < len(data):
+                headshot, offset = self._read_varint(data, offset)
+                event_data['headshot'] = bool(headshot)
+                
+            # Read penetrated count
+            if offset < len(data):
+                penetrated, offset = self._read_varint(data, offset)
+                event_data['penetrated'] = penetrated
+                
+            return event_data
+        except Exception as e:
+            logger.error(f"Error parsing player death event: {e}")
+            return {'victim_id': 0, 'attacker_id': 0, 'weapon': '', 'headshot': False}
+
+    def _parse_player_team_event(self, data: bytes) -> Dict[str, Any]:
+        """Parse player team change event data"""
+        try:
+            offset = 0
+            event_data = {}
+            
+            # Read player ID
+            if offset < len(data):
+                player_id, offset = self._read_varint(data, offset)
+                event_data['player_id'] = player_id
+                
+            # Read team ID
+            if offset < len(data):
+                team_id, offset = self._read_varint(data, offset)
+                event_data['team'] = Team(team_id).name if team_id in Team._value2member_map_ else 'UNKNOWN'
+                
+            # Read old team ID
+            if offset < len(data):
+                old_team_id, offset = self._read_varint(data, offset)
+                event_data['old_team'] = Team(old_team_id).name if old_team_id in Team._value2member_map_ else 'UNKNOWN'
+                
+            # Read disconnect
+            if offset < len(data):
+                disconnect, offset = self._read_varint(data, offset)
+                event_data['disconnect'] = bool(disconnect)
+                
+            return event_data
+        except Exception as e:
+            logger.error(f"Error parsing player team event: {e}")
+            return {'player_id': 0, 'team': 'UNKNOWN', 'old_team': 'UNKNOWN'}
+
+
+    def _parse_player_hurt_event(self, data: bytes) -> Dict[str, Any]:
+        """Parse player hurt event data"""
+        try:
+            offset = 0
+            event_data = {}
+            
+            # Read victim ID
+            if offset < len(data):
+                victim_id, offset = self._read_varint(data, offset)
+                event_data['victim_id'] = victim_id
+                
+            # Read attacker ID
+            if offset < len(data):
+                attacker_id, offset = self._read_varint(data, offset)
+                event_data['attacker_id'] = attacker_id
+                
+            # Read health remaining
+            if offset < len(data):
+                health, offset = self._read_varint(data, offset)
+                event_data['health'] = health
+                
+            # Read armor remaining
+            if offset < len(data):
+                armor, offset = self._read_varint(data, offset)
+                event_data['armor'] = armor
+                
+            # Read weapon string
+            if offset < len(data):
+                weapon, offset = self._read_string(data, offset)
+                event_data['weapon'] = weapon
+                
+            # Read damage
+            if offset < len(data):
+                damage, offset = self._read_varint(data, offset)
+                event_data['damage'] = damage
+                
+            # Read hitgroup
+            if offset < len(data):
+                hitgroup, offset = self._read_varint(data, offset)
+                event_data['hitgroup'] = hitgroup
+                
+            return event_data
+        except Exception as e:
+            logger.error(f"Error parsing player hurt event: {e}")
+            return {'victim_id': 0, 'attacker_id': 0, 'health': 0, 'damage': 0}
     
     def _parse_player_position_event(self, event_data: bytes) -> Optional[Dict[str, Any]]:
         """Parse PLAYER_POSITION event data"""
@@ -2918,12 +3123,13 @@ class DemoParser:
             'duration': struct.unpack('<f', data[16:20])[0]
         }
 
-    def _read_string(self, data: bytes, length: Optional[int] = None) -> str:
-        """Read a fixed-length string from byte data, or until end if length is None."""
-        if length is None:
-            length = len(data)
-        buffer = data[:length]  # Slice to the specified length
-        return buffer.decode('ascii', errors='replace').strip('\0')
+    def _read_string(self, data: bytes, offset: int) -> Tuple[str, int]:
+        """Read a length-prefixed string, return (string, new_offset)"""
+        length, offset = self._read_varint(data, offset)
+        if offset + length > len(data):
+            return "", offset
+        string_data = data[offset:offset + length]
+        return string_data.decode('utf-8', errors='replace'), offset + length
     
     def _read_float(self, data: bytes, offset: int) -> float:
         """Read a 32-bit float from byte data"""
@@ -3093,70 +3299,130 @@ class DemoParser:
             # Unsupported entry type
             logger.warning(f"Unsupported data table entry type: {entry_type}")
             return None
+
+    def _decode_game_events(self, data: bytes) -> List[Dict[str, Any]]:
+        """Decode CS2 game events from protobuf data"""
+        events = []
+        try:
+            offset = 0
+            while offset < len(data):
+                # Read varint event type
+                event_type = 0
+                shift = 0
+                while offset < len(data):
+                    byte = data[offset]
+                    event_type |= (byte & 0x7F) << shift
+                    offset += 1
+                    if not (byte & 0x80):
+                        break
+                    shift += 7
+
+                # Read varint data length
+                data_length = 0
+                shift = 0
+                while offset < len(data):
+                    byte = data[offset]
+                    data_length |= (byte & 0x7F) << shift
+                    offset += 1
+                    if not (byte & 0x80):
+                        break
+                    shift += 7
+
+                if offset + data_length > len(data):
+                    break
+
+                # Parse event data
+                event_data = self._parse_event_data(data[offset:offset + data_length], event_type)
+                if event_data:
+                    events.append({
+                        'type': EventType(event_type).name if event_type in EventType._value2member_map_ else 'UNKNOWN',
+                        'data': event_data
+                    })
+
+                offset += data_length
+
+        except Exception as e:
+            logger.error(f"Error decoding game events: {e}", exc_info=True)
+
+        return events
+
     def _parse(self) -> Dict[str, Any]:
-        """Parse the demo file"""
+        """Parse demo file with enhanced debugging"""
+        packets_processed = 0
         try:
             with open(self.demo_path, 'rb') as demo_file:
-                # First pass: try to parse header
                 header = self._parse_demo_header(demo_file)
                 if not header:
-                    # If first pass fails, try analyzing file structure
-                    logger.info("Initial header parse failed, analyzing file structure...")
-                    self._analyze_file_structure(demo_file)
+                    raise DemoParserException("Failed to parse demo header")
                     
-                    # Reset file position and try again with more info
-                    demo_file.seek(0)
-                    header = self._parse_demo_header(demo_file)
-                    
-                    if not header:
-                        raise DemoParserException("Could not parse demo header after multiple attempts")
-                
                 self.header = header
-                logger.info(f"Successfully parsed header: format={header.format}, map={header.map_name}")
+                logger.info(f"Successfully parsed header for map: {header.map_name}")
                 
-                # Based on format, choose appropriate packet parsing strategy
-                if header.format == DemoFormat.PBDEMS2:
-                    logger.info("Using PBDEMS2 packet parsing")
-                    packets = self._parse_pbdems2_packets(demo_file)
-                else:
-                    logger.info("Using HL2DEMO packet parsing")
-                    packets = self._parse_hl2demo_packets(demo_file)
+                events = []
+                rounds = []
+                current_round = 0
                 
-                # Process the packets
-                for packet in packets:
-                    if packet.cmd_type in self._message_type_handlers:
-                        try:
-                            self._message_type_handlers[packet.cmd_type].handle_packet(packet)
-                        except DemoParserException as e:
-                            logger.warning(f"Error handling packet: {e}")
-                            continue
+                # Track current file position
+                data_start = demo_file.tell()
+                logger.debug(f"Starting packet processing at offset: {data_start}")
+                
+                while True:
+                    current_pos = demo_file.tell()
+                    packet = self._read_pbdems2_packet(demo_file)
+                    
+                    if not packet:
+                        if current_pos == demo_file.tell():
+                            # No progress made, advance position
+                            demo_file.seek(current_pos + 1)
+                        continue
+                        
+                    packets_processed += 1
+                    if packets_processed % 100 == 0:
+                        logger.debug(f"Processed {packets_processed} packets")
+                    
+                    # Process packet based on type
+                    if packet.cmd_type == DemoPacketType.DEM_PACKET:
+                        decoded_events = self._decode_packet(packet.data)
+                        if decoded_events:
+                            logger.debug(f"Found {len(decoded_events)} events in packet")
+                            events.extend(decoded_events)
+                            
+                            for event in decoded_events:
+                                if event.get('type') == 'ROUND_START':
+                                    current_round += 1
+                                    rounds.append({
+                                        'number': current_round,
+                                        'start_tick': packet.tick,
+                                        'events': []
+                                    })
+                                if rounds:
+                                    rounds[-1]['events'].append(event)
+                                    
+                    elif packet.cmd_type == DemoPacketType.DEM_STOP:
+                        logger.info("Reached end of demo marker")
+                        break
+                        
+                logger.info(f"Finished parsing - Processed {packets_processed} packets, Found {len(events)} events in {len(rounds)} rounds")
                 
                 return {
-                    'header': self.header.to_dict() if self.header else {},
-                    'total_packets': len(packets),
-                    'map': self.header.map_name if self.header else 'Unknown',
-                    'server': self.header.server_name if self.header else 'Unknown',
-                    'rounds': len(self.rounds),
-                    'events': len(self.events)
+                    'header': self.header.to_dict(),
+                    'total_rounds': len(rounds),
+                    'total_events': len(events),
+                    'total_packets': packets_processed,
+                    'map': self.header.map_name,
+                    'rounds': rounds
                 }
                 
-        except DemoParserException as e:
-            logger.error(f"Demo parsing error: {e}")
+        except Exception as e:
+            logger.error(f"Error parsing demo: {e}", exc_info=True)
             return {
                 'error': str(e),
-                'map': 'Unknown',
-                'rounds': 0,
-                'events': 0
+                'map': getattr(self.header, 'map_name', 'Unknown'),
+                'total_rounds': 0,
+                'total_events': 0,
+                'total_packets': packets_processed
             }
-        except Exception as e:
-            logger.error(f"Unexpected error: {e}", exc_info=True)
-            return {
-                'error': f"Unexpected error: {str(e)}",
-                'map': 'Unknown',
-                'rounds': 0,
-                'events': 0
-            }
-    
+        
     def _parse_hl2demo_packets(self, demo_file: BinaryIO) -> List[DemoPacket]:
         """Parse packets from an HL2DEMO format demo file"""
         packets = []
@@ -3283,95 +3549,274 @@ class DemoParser:
             logger.error(f"Error parsing map name: {e}")
             return "unknown"
 
-    def _parse_pbdems2_packets(self, demo_file: BinaryIO) -> List[DemoPacket]:
-        """Parse packets from a PBDEMS2 format demo file"""
-        packets = []
-        try:
-            while True:
-                packet = self._read_pbdems2_packet(demo_file)
-                if packet is None:  # EOF or end of demo
-                    break
-                packets.append(packet)
-                
-                # Check for demo end
-                if packet.cmd_type == DemoPacketType.DEM_STOP:
-                    logger.info("Reached end of demo marker")
-                    break
-                    
-        except PacketReadError as e:
-            logger.warning(f"Error reading packet: {e}")
-            # Try to resync and continue
-            if self._resync_to_valid_packet(demo_file):
-                logger.info("Successfully resynced after error")
-        except Exception as e:
-            logger.error(f"Error parsing PBDEMS2 packets: {e}")
-            raise DemoParserException(f"PBDEMS2 packet parsing failed: {e}")
-            
-        return packets
 
     def _read_pbdems2_packet(self, demo_file: BinaryIO) -> Optional[DemoPacket]:
-        """Read a single packet from a PBDEMS2 demo file with better marker detection and error handling"""
+        """Read a PBDEMS2 packet with enhanced debugging"""
+        start_pos = demo_file.tell()
+        
         try:
-            # Read initial chunk for analysis
-            initial_bytes = self._peek_bytes(demo_file, 16)
-            if len(initial_bytes) < 16:
+            # Read first chunk to identify packet type
+            header = demo_file.read(8)
+            if not header:
+                logger.debug("EOF reached")
                 return None
-
-            # Known packet markers and their corresponding offsets to the packet data
-            PACKET_PATTERNS = [
-                (b'\x07\xD0', 2),   # Common packet marker
-                (b'\x01\xF1', 2),   # Alternative packet marker
-                (b'\x20\x01', 2),   # Another known pattern
-                (b'\x3C\x00', 0),   # Additional PBDEMS2 marker
-                (b'\x40\x00', 0),   # Additional PBDEMS2 marker
-            ]
-
-            # Log initial bytes for debugging
-            hex_str = ' '.join(f'{b:02x}' for b in initial_bytes[:4])
-            logger.debug(f"Initial bytes: {hex_str}")
-
-            # Try to find a valid marker
-            found_pattern = None
-            pattern_offset = 0
-
-            for pattern, offset in PACKET_PATTERNS:
-                if initial_bytes.startswith(pattern):
-                    found_pattern = pattern
-                    pattern_offset = offset
-                    break
-
-            if not found_pattern:
-                # If no known pattern found, try PBDEMS2 command detection
-                cmd_type = initial_bytes[0]
-                if 0 <= cmd_type <= 32:  # Valid command range
-                    pattern_offset = 0
-                    found_pattern = initial_bytes[:1]
-                else:
-                    # No valid marker found, try to resynchronize
-                    return self._attempt_packet_recovery(demo_file)
-
-            # Parse packet header after marker
-            pos = pattern_offset
-            cmd_type = initial_bytes[pos]
-            tick = int.from_bytes(initial_bytes[pos+1:pos+3], byteorder='little')
-            size = int.from_bytes(initial_bytes[pos+3:pos+5], byteorder='little')
-
-            logger.debug(f"Packet header: type={cmd_type}, tick={tick}, size={size}")
-
-            # Validate packet header
-            if not self._is_valid_packet_header(cmd_type, tick, size):
-                return self._attempt_packet_recovery(demo_file)
-
-            # Read packet data
-            remaining_data = demo_file.read(size)
-            if len(remaining_data) < size:
-                raise PacketReadError(f"Incomplete packet: expected {size}, got {len(remaining_data)}")
-
-            return DemoPacket(cmd_type=cmd_type, tick=tick, data=remaining_data)
+                
+            # Debug log the header bytes
+            logger.debug(f"Packet header at {start_pos}: {' '.join(f'{b:02x}' for b in header)}")
+            
+            # Handle different packet formats
+            if header.startswith(b'PBDM'):
+                # PBDEMS2 format
+                msg_type = int.from_bytes(header[4:5], byteorder='little')
+                size = int.from_bytes(header[5:8], byteorder='little')
+                logger.debug(f"PBDEMS2 packet: type={msg_type}, size={size}")
+                
+                data = demo_file.read(size)
+                if len(data) < size:
+                    logger.warning(f"Incomplete PBDEMS2 data: expected {size}, got {len(data)}")
+                    return None
+                    
+                return DemoPacket(cmd_type=msg_type, tick=0, data=data)
+                
+            # Standard packet format
+            demo_file.seek(start_pos)
+            cmd_type = int.from_bytes(header[0:1], byteorder='little')
+            tick = int.from_bytes(header[1:5], byteorder='little')
+            size = int.from_bytes(header[5:8], byteorder='little')
+            
+            logger.debug(f"Standard packet: type={cmd_type}, tick={tick}, size={size}")
+            
+            if not self._validate_packet_header_strict(cmd_type, tick, size):
+                logger.debug("Invalid packet header, seeking next valid packet")
+                demo_file.seek(start_pos + 1)
+                return None
+                
+            data = demo_file.read(size)
+            if len(data) < size:
+                logger.warning(f"Incomplete packet data: expected {size}, got {len(data)}")
+                return None
+                
+            return DemoPacket(cmd_type=cmd_type, tick=tick, data=data)
 
         except Exception as e:
-            logger.error(f"Error reading PBDEMS2 packet: {e}", exc_info=True)
-            return self._attempt_packet_recovery(demo_file)
+            logger.error(f"Error reading packet at {start_pos}: {e}")
+            demo_file.seek(start_pos + 1)
+            return None
+
+    def _validate_protobuf_packet(self, cmd_type: int, tick: int, size: int) -> bool:
+        """Validate a protobuf packet structure"""
+        # CS2 protobuf message types
+        VALID_MESSAGE_TYPES = {
+            1: "GameEvent",
+            2: "PacketEntity", 
+            3: "UserCmd",
+            4: "Stop",
+            5: "FileInfo",
+            6: "StringTable",
+            7: "ConsoleCmd",
+            8: "DataTable",
+            9: "CustomData",
+            10: "Message",
+            11: "SyncTick",
+            12: "StringCmd",
+            13: "SignonState"
+        }
+        
+        # Basic validation
+        if cmd_type not in VALID_MESSAGE_TYPES:
+            return False
+            
+        # Size validation based on message type
+        if size <= 0:
+            return False
+            
+        MAX_SIZES = {
+            1: 64 * 1024,      # Game events
+            2: 256 * 1024,     # Packet entities 
+            3: 4 * 1024,       # User commands
+            6: 1024 * 1024,    # String tables
+            8: 1024 * 1024,    # Data tables
+            9: 10 * 1024 * 1024  # Custom data
+        }
+        
+        max_size = MAX_SIZES.get(cmd_type, 64 * 1024)  # Default 64KB
+        if size > max_size:
+            return False
+            
+        # Tick validation
+        if cmd_type not in {4, 5, 7}:  # These can have special tick values
+            if tick < 0 or tick > 1_000_000:  # ~4.3 hours at 64 tick
+                return False
+                
+        return True
+
+    def _check_protobuf_validity(self, data: bytes) -> int:
+        """Check if data looks like a valid protobuf message"""
+        if len(data) < 4:
+            return 0
+            
+        confidence = 0
+        
+        # Check for valid field numbers
+        if data[0] >> 3 in range(1, 17):  # Field numbers 1-16 are common
+            confidence += 1
+            
+        # Check for valid wire types
+        if data[0] & 0x07 in {0, 1, 2, 5}:  # Valid wire types
+            confidence += 1
+            
+        # Look for length-prefixed fields
+        if data[0] & 0x07 == 2:  # Length wire type
+            try:
+                length = data[1]
+                if length > 0 and length < 128:  # Simple length check
+                    confidence += 1
+            except:
+                pass
+                
+        return confidence
+
+    def _validate_cs2_command(self, cmd_type: int, size: int, flags: int) -> bool:
+        """Validate CS2-specific command structure"""
+        # Known CS2 command types
+        VALID_CS2_COMMANDS = {
+            0x01: "GameEvent",
+            0x02: "PacketEntity",
+            0x03: "FullPacket",
+            0x04: "UpdateStringTable",
+            0x05: "CreateStringTable",
+            0x06: "UserMessage",
+        }
+
+        # Size limits for different command types
+        MAX_SIZES = {
+            0x01: 1024 * 64,    # Game events
+            0x02: 1024 * 256,   # Packet entities
+            0x03: 1024 * 1024,  # Full packets
+            0x04: 1024 * 128,   # String table updates
+            0x05: 1024 * 256,   # String table creation
+            0x06: 1024 * 32,    # User messages
+        }
+
+        if cmd_type not in VALID_CS2_COMMANDS:
+            return False
+
+        max_allowed = MAX_SIZES.get(cmd_type, 1024 * 64)  # Default 64KB
+        if size <= 0 or size > max_allowed:
+            return False
+
+        # Validate flags (CS2 specific)
+        VALID_FLAGS = {0x00, 0x01, 0x02, 0x04, 0x08}  # Known valid flag values
+        if flags not in VALID_FLAGS:
+            return False
+
+        return True
+
+    def _find_next_valid_packet(self, demo_file: BinaryIO) -> Optional[DemoPacket]:
+        """Find next valid packet with CS2-specific markers"""
+        MAX_SCAN = 16384  # 16KB scan window
+        SYNC_PATTERNS = [
+            (b'PBDM', 4),
+            (b'\x07\xD0', 2),
+            (b'\x01\xF1', 2),
+            # CS2 game event markers
+            (b'\x01\x00\x00\x00', 0),  # Game event
+            (b'\x02\x00\x00\x00', 0),  # Packet entity
+            (b'\x07\x00\x00\x00', 0),  # Demo packet
+        ]
+
+        start_pos = demo_file.tell()
+        scan_data = demo_file.read(MAX_SCAN)
+        demo_file.seek(start_pos)
+
+        for pattern, offset in SYNC_PATTERNS:
+            pos = scan_data.find(pattern)
+            if pos >= 0:
+                demo_file.seek(start_pos + pos)
+                logger.debug(f"Found sync pattern at offset {pos}")
+                return self._read_pbdems2_packet(demo_file)
+
+        # If no pattern found, skip ahead
+        demo_file.seek(start_pos + min(len(scan_data), 8))
+        return None
+    
+    VALID_PACKET_TYPES = {
+    1: "SignOn",
+    2: "Packet",
+    3: "SyncTick",
+    4: "ConsoleCmd",
+    5: "UserCmd",
+    6: "DataTables",
+    7: "Stop",
+    8: "StringTables",
+}
+        
+    def _attempt_recovery(self, demo_file: BinaryIO) -> Optional[DemoPacket]:
+        """Improved packet recovery with pattern matching"""
+        MAX_SCAN = 8192  # Scan up to 8KB ahead
+        recovery_patterns = [
+            b'PBDM',
+            b'\x07\xD0',
+            b'\x01\xF1',
+            b'\x02\x00\x00\x00',  # DEM_STOP
+            b'\x07\x00\x00\x00',  # DEM_PACKET
+        ]
+        
+        start_pos = demo_file.tell()
+        scan_buffer = demo_file.read(MAX_SCAN)
+        demo_file.seek(start_pos)
+        
+        # Look for recovery patterns
+        for pattern in recovery_patterns:
+            pos = scan_buffer.find(pattern)
+            if pos >= 0:
+                # Found potential sync point
+                demo_file.seek(start_pos + pos)
+                logger.info(f"Found recovery point after {pos} bytes")
+                return self._read_pbdems2_packet(demo_file)
+        
+        # If no pattern found, try small incremental seek
+        demo_file.seek(start_pos + 1)
+        return None
+
+    def _validate_packet_header_strict(self, cmd_type: int, tick: int, size: int) -> bool:
+        """Strict validation of packet headers with debug logging"""
+        if cmd_type not in DemoPacketType.VALID_TYPES:
+            logger.debug(f"Invalid command type: {cmd_type}")
+            return False
+
+        # Size validation
+        if size <= 0 or size > DemoPacketType.MAX_SIZE:
+            logger.debug(f"Invalid size: {size}")
+            return False
+
+        # Tick validation (except for special packets)
+        if cmd_type not in {DemoPacketType.DEM_FILEHEADER, DemoPacketType.DEM_FILEINFO}:
+            if tick < 0 or tick > 1_000_000:  # ~4.3 hours at 64 tick
+                logger.debug(f"Invalid tick: {tick}")
+                return False
+
+        logger.debug(f"Valid packet - type: {cmd_type}, tick: {tick}, size: {size}")
+        return True
+
+    def _is_valid_raw_packet(self, header_bytes: bytes) -> bool:
+        """Check if bytes could be a raw packet without markers"""
+        if len(header_bytes) < 9:
+            return False
+            
+        try:
+            cmd_type = header_bytes[0]
+            tick = int.from_bytes(header_bytes[1:5], byteorder='little') 
+            size = int.from_bytes(header_bytes[5:9], byteorder='little')
+            
+            # Basic sanity checks
+            return (
+                cmd_type in range(33) and  # Valid command types 
+                tick >= 0 and
+                0 <= size <= 1024 * 1024  # Max 1MB packet size
+            )
+        except:
+            return False
         
     def _read_line(self, demo_file: BinaryIO) -> Optional[bytes]:
         """Read a line of text from the demo file"""
